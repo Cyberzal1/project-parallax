@@ -1,0 +1,22 @@
+# Secrets & Environment (Non-Negotiable)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+credentials.json
+service-account*.json
+
+# Python & Virtual Env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Git Worktrees for Subagent Patch Verification
+.worktrees/
+wt-*/

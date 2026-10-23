@@ -1,0 +1,174 @@
+# 2.1 Create benchmark_target/infra/main.tf (GCP Cloud Run AI Agent + IAM)
+@'
+terraform {
+  required_version = ">= 1.9.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
+    }
+  }
+}
+
+variable "project_id" {
+  type    = string
+  default = "gcp-sg-parallax-sandbox"
+}
+
+# Non-Human Identity (NHI) for the Cloud Run Vertex AI Agent
+resource "google_service_account" "sa_agent_runner" {
+  account_id   = "sa-agent-runner"
+  display_name = "Vertex AI Workspace Ops Agent Service Account"
+}
+
+# Publicly reachable Cloud Run v2 Service hosting the AI Agent
+resource "google_cloud_run_v2_service" "vertex_ops_agent" {
+  name     = "vertex-ops-agent"
+  location = "asia-southeast1"
+  ingress  = "INGRESS_TRAFFIC_ALL"
+
+  template {
+    service_account = google_service_account.sa_agent_runner.email
+    containers {
+      image = "asia-southeast1-docker.pkg.dev/gcp-sg-parallax-sandbox/agents/vertex-ops:1.0.0"
+    }
+  }
+}
+
+# INTENTIONAL ARCHITECTURAL FLAW (Step 01 Prepare / Step 02 Scan Blindspot):
+# Grants project-wide Secret Manager access instead of scoping to non-sensitive workspace secrets.
+resource "google_project_iam_member" "agent_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+
+# Secondary transitive privilege risk: allows token minting on the project
+resource "google_project_iam_member" "agent_token_creator" {
+  project = var.project_id
+  role    = "roles/iam.serviceAccountTokenCreator"
+  member  = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+'@ | Set-Content -Path "benchmark_target/infra/main.tf" -Encoding utf8
+
+# 2.2 Create benchmark_target/app/service.py (Cloud Run AI Agent Handler)
+@'
+"""Cloud Run Vertex AI Agent Tool Handler (Benchmark Target)."""
+
+from dataclasses import dataclass
+import re
+from typing import Any
+
+ALLOWED_WORKSPACE_PREFIX = "workspace-doc-"
+SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{3,64}$")
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    """Structured Cloud Audit Log entry emitted for Google SecOps monitoring."""
+
+    principal_email: str
+    caller_identity: str
+    tool_name: str
+    target_secret_uri: str
+    status: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ToolResponse:
+    """Result returned by the AI Agent tool execution."""
+
+    allowed: bool
+    resolved_secret_uri: str
+    audit_event: AuditEvent
+
+
+def verify_caller_auth(auth_header: str | None) -> str:
+    """Enforce authentication upfront before any handler execution."""
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise PermissionError("Missing or invalid Bearer authentication token.")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if len(token) < 12 or not SAFE_ID_PATTERN.match(token):
+        raise PermissionError("Malformed caller token.")
+    return f"user:{token}"
+
+
+def execute_agent_tool(
+    auth_header: str | None,
+    tool_payload: dict[str, Any],
+    project_id: str = "gcp-sg-parallax-sandbox",
+) -> ToolResponse:
+    """Execute the AI Agent workspace secret lookup tool.
+
+    Contains an intentional Cross-Layer Confused Deputy flaw:
+    While `primary_id` is checked against `ALLOWED_WORKSPACE_PREFIX`, an optional
+    `fallback_secret_id` in the agent tool context bypasses the prefix check and
+    leverages the over-permissive `roles/secretmanager.secretAccessor` IAM role.
+    """
+    caller = verify_caller_auth(auth_header)
+    primary_id = str(tool_payload.get("resource_id", ""))
+    fallback_id = str(tool_payload.get("fallback_secret_id", ""))
+
+    if not SAFE_ID_PATTERN.match(primary_id):
+        raise ValueError("Invalid resource_id format.")
+
+    if not primary_id.startswith(ALLOWED_WORKSPACE_PREFIX):
+        audit = AuditEvent(
+            principal_email="sa-agent-runner@gcp-sg-parallax-sandbox.iam.gserviceaccount.com",
+            caller_identity=caller,
+            tool_name="read_workspace_context",
+            target_secret_uri=f"projects/{project_id}/secrets/{primary_id}",
+            status="DENIED_BY_APP_FILTER",
+            reason="Resource does not match allowed workspace prefix.",
+        )
+        return ToolResponse(
+            allowed=False,
+            resolved_secret_uri=audit.target_secret_uri,
+            audit_event=audit,
+        )
+
+    # CROSS-LAYER FLAW: Agent tool falls back to `fallback_id` when `use_fallback`
+    # is set in tool metadata, without re-validating ALLOWED_WORKSPACE_PREFIX.
+    effective_secret_id = primary_id
+    if tool_payload.get("use_fallback") is True and fallback_id:
+        if not SAFE_ID_PATTERN.match(fallback_id):
+            raise ValueError("Invalid fallback_secret_id format.")
+        effective_secret_id = fallback_id
+
+    secret_uri = f"projects/{project_id}/secrets/{effective_secret_id}/versions/latest"
+    audit = AuditEvent(
+        principal_email="sa-agent-runner@gcp-sg-parallax-sandbox.iam.gserviceaccount.com",
+        caller_identity=caller,
+        tool_name="read_workspace_context",
+        target_secret_uri=secret_uri,
+        status="GRANTED",
+        reason="Tool execution completed.",
+    )
+    return ToolResponse(
+        allowed=True,
+        resolved_secret_uri=secret_uri,
+        audit_event=audit,
+    )
+'@ | Set-Content -Path "benchmark_target/app/service.py" -Encoding utf8
+
+# 2.3 Create benchmark_target/secops/rules.yaml (Simulated Google SecOps Rules)
+@'
+rules:
+  - rule_id: SECOPS_GCP_001
+    name: Agent_Blocked_Secret_Access_Attempt
+    description: Alerts when the application filter blocks unauthorized secret lookup.
+    match:
+      tool_name: read_workspace_context
+      status: DENIED_BY_APP_FILTER
+    severity: MEDIUM
+
+  - rule_id: SECOPS_GCP_002
+    name: Agent_Prod_Secret_Exfiltration_Attempt
+    description: Detects GRANTED access to restricted prod-* secrets ONLY when logged under read_workspace_context.
+    match:
+      tool_name: read_workspace_context
+      status: GRANTED
+      target_secret_uri_contains: "/secrets/prod-"
+    severity: CRITICAL
+'@ | Set-Content -Path "benchmark_target/secops/rules.yaml" -Encoding utf8

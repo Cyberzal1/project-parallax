@@ -1,0 +1,5 @@
+# tasks/lessons.md — Self-Improvement Log
+
+- **2026-10-23 (Third-Party Stubs & Runtime Subscripting):** `python-hcl2` and `networkx` require `[[tool.mypy.overrides]]` (`module = ["hcl2", "hcl2.*", "networkx", "networkx.*"]`, `ignore_missing_imports = true`, `implicit_reexport = true`). Never subscript `nx.DiGraph[str]` at runtime in Python 3.13 because `networkx.DiGraph` does not implement `__class_getitem__`.
+- **2026-10-23 (Windows PowerShell UTF-8 BOM & ExecutionPolicy):** Windows PowerShell `Set-Content -Encoding utf8` prepends a UTF-8 BOM (`\ufeff`), and default ExecutionPolicy blocks `.ps1` scripts. Rule: Use Python `.py` helper scripts (`Path.write_text(..., encoding="utf-8", newline="\n")`) for multi-file generation.
+- **2026-10-23 (Never Use Complex Multi-Quote `python -c` One-Liners in PowerShell):** Pasting `python -c "..."` with nested `\"` and `{...}` braces into interactive Windows PowerShell crashes `PSReadLine` with `OperationStopped: Object reference not set to an instance of an object`. Rule: Always use a clean `.py` script file instead of escaped `python -c` strings.
