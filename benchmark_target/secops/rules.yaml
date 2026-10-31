@@ -1,17 +1,15 @@
 rules:
-  - rule_id: SECOPS_GCP_001
-    name: Agent_Blocked_Secret_Access_Attempt
-    description: Alerts when the application filter blocks unauthorized secret lookup.
+  - rule_id: "SECOPS_GCP_001"
+    severity: "HIGH"
+    description: "Detects workspace document secret access via Vertex AI Agent."
     match:
-      tool_name: read_workspace_context
-      status: DENIED_BY_APP_FILTER
-    severity: MEDIUM
+      event_type: "SECRET_MANAGER_ACCESS"
+      tool_name: "read_workspace_context"
 
-  - rule_id: SECOPS_GCP_002
-    name: Agent_Prod_Secret_Exfiltration_Attempt
-    description: Detects GRANTED access to restricted prod-* secrets ONLY when logged under read_workspace_context.
+  - rule_id: "SECOPS_GCP_002"
+    severity: "CRITICAL"
+    description: "Detects privilege escalation attempts against prod-* secrets."
     match:
-      tool_name: read_workspace_context
-      status: GRANTED
-      target_secret_uri_contains: "/secrets/prod-"
-    severity: CRITICAL
+      event_type: "SECRET_MANAGER_ACCESS"
+      tool_name: "read_workspace_context"
+      target_secret_prefix: "prod-"

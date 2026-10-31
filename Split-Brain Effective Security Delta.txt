@@ -1,0 +1,6 @@
+Effective_Security_Delta = (0.45 * IaC_Reachability_Risk)
+                         + (0.35 * Code_Dataflow_Risk)
+                         + (0.20 * Telemetry_Blindspot_Risk)
+
+Split_Brain_Detected     = (Code_Dataflow_Risk < 0.50)
+                           AND (IaC_Reachability_Risk >= 0.70 OR Telemetry_Blindspot_Risk >= 0.70)

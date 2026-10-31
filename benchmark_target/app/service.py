@@ -1,97 +1,88 @@
-"""Cloud Run Vertex AI Agent Tool Handler (Benchmark Target)."""
+"""Benchmark Cloud Run AI Agent Service with upfront authn and cross-layer fallback flaw."""
 
 import re
-from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel
+
+SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+$")
 ALLOWED_WORKSPACE_PREFIX = "workspace-doc-"
-SAFE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{3,64}$")
+PROJECT_ID = "gcp-sg-parallax-sandbox"
 
 
-@dataclass(frozen=True)
-class AuditEvent:
-    """Structured Cloud Audit Log entry emitted for Google SecOps monitoring."""
+class AuditEvent(BaseModel):
+    """Structured Cloud Audit Log payload evaluated by Google SecOps."""
 
-    principal_email: str
+    event_type: str
     caller_identity: str
+    service_account: str
     tool_name: str
-    target_secret_uri: str
-    status: str
-    reason: str
+    target_secret: str
+    allowed: bool
 
 
-@dataclass(frozen=True)
-class ToolResponse:
-    """Result returned by the AI Agent tool execution."""
+class ToolExecutionResult(BaseModel):
+    """Structured response returned by the Cloud Run AI Agent tool."""
 
     allowed: bool
+    caller: str
     resolved_secret_uri: str
     audit_event: AuditEvent
 
 
 def verify_caller_auth(auth_header: str | None) -> str:
-    """Enforce authentication upfront before any handler execution."""
+    """Enforce upfront authentication guardrail before parsing tool payload."""
     if not auth_header or not auth_header.startswith("Bearer "):
         raise PermissionError("Missing or invalid Bearer authentication token.")
     token = auth_header.removeprefix("Bearer ").strip()
-    if len(token) < 12 or not SAFE_ID_PATTERN.match(token):
-        raise PermissionError("Malformed caller token.")
+    if not token or len(token) < 10:
+        raise PermissionError("Malformed session token.")
     return f"user:{token}"
 
 
 def execute_agent_tool(
     auth_header: str | None,
     tool_payload: dict[str, Any],
-    project_id: str = "gcp-sg-parallax-sandbox",
-) -> ToolResponse:
-    """Execute the AI Agent workspace secret lookup tool.
-
-    Contains an intentional Cross-Layer Confused Deputy flaw:
-    While `primary_id` is checked against `ALLOWED_WORKSPACE_PREFIX`, an optional
-    `fallback_secret_id` in the agent tool context bypasses the prefix check and
-    leverages the over-permissive `roles/secretmanager.secretAccessor` IAM role.
-    """
+) -> ToolExecutionResult:
+    """Execute agent tool logic with a subtle cross-layer Confused Deputy bypass."""
     caller = verify_caller_auth(auth_header)
+
     primary_id = str(tool_payload.get("resource_id", ""))
+    use_fallback = bool(tool_payload.get("use_fallback", False))
     fallback_id = str(tool_payload.get("fallback_secret_id", ""))
 
     if not SAFE_ID_PATTERN.match(primary_id):
         raise ValueError("Invalid resource_id format.")
 
     if not primary_id.startswith(ALLOWED_WORKSPACE_PREFIX):
-        audit = AuditEvent(
-            principal_email="sa-agent-runner@gcp-sg-parallax-sandbox.iam.gserviceaccount.com",
-            caller_identity=caller,
-            tool_name="read_workspace_context",
-            target_secret_uri=f"projects/{project_id}/secrets/{primary_id}",
-            status="DENIED_BY_APP_FILTER",
-            reason="Resource does not match allowed workspace prefix.",
-        )
-        return ToolResponse(
-            allowed=False,
-            resolved_secret_uri=audit.target_secret_uri,
-            audit_event=audit,
-        )
+        raise PermissionError("Access denied: resource_id outside workspace scope.")
 
-    # CROSS-LAYER FLAW: Agent tool falls back to `fallback_id` when `use_fallback`
-    # is set in tool metadata, without re-validating ALLOWED_WORKSPACE_PREFIX.
     effective_secret_id = primary_id
-    if tool_payload.get("use_fallback") is True and fallback_id:
+
+    # [ARCHITECTURAL FLAW / CONFUSED DEPUTY]
+    # Primary ID validates ALLOWED_WORKSPACE_PREFIX, but fallback_id overwrites
+    # effective_secret_id without verifying ALLOWED_WORKSPACE_PREFIX!
+    if use_fallback and fallback_id:
         if not SAFE_ID_PATTERN.match(fallback_id):
             raise ValueError("Invalid fallback_secret_id format.")
         effective_secret_id = fallback_id
 
-    secret_uri = f"projects/{project_id}/secrets/{effective_secret_id}/versions/latest"
-    audit = AuditEvent(
-        principal_email="sa-agent-runner@gcp-sg-parallax-sandbox.iam.gserviceaccount.com",
-        caller_identity=caller,
-        tool_name="read_workspace_context",
-        target_secret_uri=secret_uri,
-        status="GRANTED",
-        reason="Tool execution completed.",
+    resolved_uri = (
+        f"projects/{PROJECT_ID}/secrets/{effective_secret_id}/versions/latest"
     )
-    return ToolResponse(
+
+    audit = AuditEvent(
+        event_type="SECRET_MANAGER_ACCESS",
+        caller_identity=caller,
+        service_account=f"sa-agent-runner@{PROJECT_ID}.iam.gserviceaccount.com",
+        tool_name="read_workspace_context",
+        target_secret=effective_secret_id,
         allowed=True,
-        resolved_secret_uri=secret_uri,
+    )
+
+    return ToolExecutionResult(
+        allowed=True,
+        caller=caller,
+        resolved_secret_uri=resolved_uri,
         audit_event=audit,
     )

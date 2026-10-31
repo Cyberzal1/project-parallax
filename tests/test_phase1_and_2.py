@@ -19,9 +19,7 @@ def test_gate1_gitignore_and_windows_guardrails() -> None:
     env_example_path = ROOT_DIR / ".env.example"
 
     assert gitignore_path.exists(), ".gitignore must exist before git init"
-    assert gitattributes_path.exists(), (
-        ".gitattributes must exist for Windows LF safety"
-    )
+    assert gitattributes_path.exists(), ".gitattributes must exist for Windows LF safety"
     assert env_example_path.exists(), ".env.example must exist"
 
     gitignore_text = gitignore_path.read_text(encoding="utf-8")
@@ -30,7 +28,6 @@ def test_gate1_gitignore_and_windows_guardrails() -> None:
             f"Missing {required_pattern} in .gitignore"
         )
 
-    # Ensure no actual .env file is committed or contains real keys in .env.example
     env_example_text = env_example_path.read_text(encoding="utf-8")
     assert "AIza" not in env_example_text, "Hardcoded Google API key detected!"
 
@@ -58,7 +55,11 @@ def test_gate2_reproduce_cross_layer_vulnerability_exists() -> None:
         for res in tf_data.get("resource", [])
         if "google_project_iam_member" in res
     ]
-    roles = [binding["role"] for item in iam_resources for binding in item.values()]
+    roles = [
+        binding["role"]
+        for item in iam_resources
+        for binding in item.values()
+    ]
     assert "roles/secretmanager.secretAccessor" in roles
 
     payload: dict[str, Any] = {
@@ -81,9 +82,7 @@ def test_gate2_reproduce_cross_layer_vulnerability_exists() -> None:
 
 @pytest.mark.xfail(
     strict=True,
-    reason=(
-        "Baseline unpatched architecture intentionally fails least-privilege invariant."
-    ),
+    reason="Baseline unpatched architecture intentionally fails least-privilege invariant.",
 )
 def test_gate2_architectural_security_invariant() -> None:
     """Security Invariant: Agent must NEVER resolve non-workspace secrets."""

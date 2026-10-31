@@ -1,0 +1,26 @@
+Project PARALLAX/
+|-- benchmark_target/
+|   |-- app/
+|   |   `-- service.py             # Cloud Run Vertex AI Agent handler (upfront authn + fallback flaw)
+|   |-- infra/
+|   |   `-- main.tf                # GCP Cloud Run v2 + Service Account NHI + IAM bindings
+|   `-- secops/
+|       `-- rules.yaml             # Google SecOps (Chronicle) runtime detection signatures
+|-- parallax/
+|   |-- schemas.py                 # Immutable Pydantic v2 models enforcing Subagent Contract
+|   |-- graph_analyzer.py          # Subagent 01: HCL2 -> NetworkX GCP IAM reachability graph
+|   |-- cross_layer_auditor.py     # Subagent 02: Python AST + optional Gemini 2.5 reasoning
+|   |-- patch_verifier.py          # Subagent 03: Isolated Git worktree Split-Brain evaluator
+|   |-- telemetry_validator.py     # Subagent 04: AuditEvent AST vs. SecOps YAML drift detector
+|   |-- orchestrator.py            # Main Thread Orchestrator & patch simulation mutators
+|   `-- cli.py                     # Interactive CLI demonstration entry point
+|-- tests/
+|   |-- test_phase1_and_2.py       # Verification Gates 1 & 2 (Guardrails, Authn, Baseline xfail)
+|   `-- test_phase3_subagents.py   # Verification Gate 3 (Subagents 01-04 & Git worktree proof)
+|-- tasks/
+|   |-- context.md                 # Cold-start architectural state & environment record
+|   |-- lessons.md                 # Self-improvement engineering rules log
+|   `-- todo.md                    # Verified implementation plan & Staff Review diff summary
+|-- GEMINI.md                      # Engineering operating manual & non-negotiable guardrails
+|-- pyproject.toml                 # Strict mypy, ruff, and pytest configuration
+`-- requirements.txt               # Pinned, auditable Python dependencies

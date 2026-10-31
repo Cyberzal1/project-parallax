@@ -100,6 +100,7 @@ def test_gate3_end_to_end_orchestrator_with_git_worktrees() -> None:
     assert len(orchestrator_report.split_brain_evaluations) == 3
 
     by_name = {d.patch_name: d for d in orchestrator_report.split_brain_evaluations}
+    assert by_name["baseline-unpatched"].split_brain_detected is False
     assert by_name["wt-symptom-patch"].split_brain_detected is True
     assert by_name["wt-architectural-patch"].split_brain_detected is False
     assert (

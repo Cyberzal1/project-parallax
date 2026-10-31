@@ -45,7 +45,7 @@ def evaluate_directory_delta(worktree_root: Path, patch_name: str) -> SplitBrain
         4,
     )
     high_infra_or_secops = iac_risk >= 0.7 or telemetry_risk >= 0.7
-    split_brain = high_infra_or_secops and (code_risk < 0.5 or iac_risk >= 0.7)
+    split_brain = (code_risk < 0.5) and high_infra_or_secops
 
     if iac_risk < 0.2 and code_risk < 0.2 and telemetry_risk < 0.2:
         split_brain = False
