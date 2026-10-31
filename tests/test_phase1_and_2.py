@@ -19,7 +19,9 @@ def test_gate1_gitignore_and_windows_guardrails() -> None:
     env_example_path = ROOT_DIR / ".env.example"
 
     assert gitignore_path.exists(), ".gitignore must exist before git init"
-    assert gitattributes_path.exists(), ".gitattributes must exist for Windows LF safety"
+    assert gitattributes_path.exists(), (
+        ".gitattributes must exist for Windows LF safety"
+    )
     assert env_example_path.exists(), ".env.example must exist"
 
     gitignore_text = gitignore_path.read_text(encoding="utf-8")
@@ -82,7 +84,10 @@ def test_gate2_reproduce_cross_layer_vulnerability_exists() -> None:
 
 @pytest.mark.xfail(
     strict=True,
-    reason="Baseline unpatched architecture intentionally fails least-privilege invariant.",
+    reason=(
+        "Baseline unpatched architecture intentionally "
+        "fails least-privilege invariant."
+    ),
 )
 def test_gate2_architectural_security_invariant() -> None:
     """Security Invariant: Agent must NEVER resolve non-workspace secrets."""

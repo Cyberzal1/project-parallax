@@ -1,4 +1,4 @@
-"""Benchmark Cloud Run AI Agent Service with upfront authn and cross-layer fallback flaw."""
+"""Benchmark Cloud Run AI Agent Service with cross-layer fallback flaw."""
 
 import re
 from typing import Any
