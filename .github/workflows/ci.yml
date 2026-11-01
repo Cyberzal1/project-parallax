@@ -1,0 +1,39 @@
+name: PARALLAX Verification Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (with full history for Git worktrees)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Gate 1 - Ruff Security & Style Lint
+        run: ruff check parallax benchmark_target tests
+
+      - name: Gate 2 - Mypy Strict Static Typecheck
+        run: mypy parallax benchmark_target tests
+
+      - name: Gate 3 - Pytest Suite (Including Baseline xfail & Mutation Tests)
+        run: pytest
+
+      - name: Gate 4 - Live CLI Split-Brain Differential Simulation
+        run: python -m parallax.cli

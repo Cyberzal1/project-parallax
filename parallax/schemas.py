@@ -12,6 +12,7 @@ class Severity(StrEnum):
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
+    INFO = "INFO"
 
 
 class Layer(StrEnum):
@@ -21,6 +22,16 @@ class Layer(StrEnum):
     CODE_AST = "CODE_AST"
     PATCH_WORKTREE = "PATCH_WORKTREE"
     SECOPS_TELEMETRY = "SECOPS_TELEMETRY"
+
+
+class PatchClassification(StrEnum):
+    """Explicit 5-state classification for candidate worktree patches."""
+
+    NO_OP_BASELINE = "NO_OP_BASELINE"
+    SPLIT_BRAIN_REMEDIATION = "SPLIT_BRAIN_REMEDIATION"
+    HOLISTIC_REMEDIATION = "HOLISTIC_REMEDIATION"
+    PARTIAL_REMEDIATION = "PARTIAL_REMEDIATION"
+    PURE_REGRESSION = "PURE_REGRESSION"
 
 
 class Finding(BaseModel):
@@ -34,6 +45,7 @@ class Finding(BaseModel):
     title: str
     description: str
     remediation_hint: str
+    file_path: str = ""
 
 
 class SubagentReport(BaseModel):
@@ -42,7 +54,7 @@ class SubagentReport(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     subagent_name: str
-    countered_defense_step: str
+    countered_defense_step: str = ""
     findings: list[Finding] = Field(default_factory=list)
     files_touched: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
@@ -50,7 +62,7 @@ class SubagentReport(BaseModel):
 
 
 class SplitBrainDelta(BaseModel):
-    """Mathematical evaluation of cross-layer remediation completeness."""
+    """Before/after differential evaluation of cross-layer remediation."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -58,9 +70,17 @@ class SplitBrainDelta(BaseModel):
     iac_reachability_risk: float = Field(ge=0.0, le=1.0)
     code_dataflow_risk: float = Field(ge=0.0, le=1.0)
     telemetry_blindspot_risk: float = Field(ge=0.0, le=1.0)
-    effective_security_delta: float
+    effective_security_delta: float = Field(ge=0.0, le=1.0)
     split_brain_detected: bool
     summary: str
+    patch_state: PatchClassification = PatchClassification.NO_OP_BASELINE
+    before_iac_risk: float = Field(default=0.95, ge=0.0, le=1.0)
+    before_code_risk: float = Field(default=0.95, ge=0.0, le=1.0)
+    before_telemetry_risk: float = Field(default=0.05, ge=0.0, le=1.0)
+    delta_iac_risk: float = Field(default=0.0, ge=-1.0, le=1.0)
+    delta_code_risk: float = Field(default=0.0, ge=-1.0, le=1.0)
+    delta_telemetry_risk: float = Field(default=0.0, ge=-1.0, le=1.0)
+    files_touched: list[str] = Field(default_factory=list)
 
 
 class OrchestratorReport(BaseModel):

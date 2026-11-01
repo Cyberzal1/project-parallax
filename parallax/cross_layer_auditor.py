@@ -7,41 +7,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 
+from parallax.ast_utils import AgentToolASTVisitor
 from parallax.schemas import Finding, Layer, Severity, SubagentReport
 
-
-class AgentToolASTVisitor(ast.NodeVisitor):
-    """AST visitor inspecting execute_agent_tool for fallback bypasses."""
-
-    def __init__(self) -> None:
-        self.reads_fallback_param: bool = False
-        self.revalidates_fallback_prefix: bool = False
-        self.overrides_effective_secret: bool = False
-        self.audited_tool_names: list[str] = []
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        if node.name == "execute_agent_tool":
-            source_segment = ast.unparse(node)
-            has_double = '"fallback_secret_id"' in source_segment
-            has_single = "'fallback_secret_id'" in source_segment
-            if has_double or has_single:
-                self.reads_fallback_param = True
-            if "effective_secret_id = fallback_id" in source_segment:
-                self.overrides_effective_secret = True
-            if "fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX)" in source_segment:
-                self.revalidates_fallback_prefix = True
-
-            for subnode in ast.walk(node):
-                if isinstance(subnode, ast.keyword) and subnode.arg == "tool_name":
-                    if isinstance(subnode.value, ast.Constant) and isinstance(
-                        subnode.value.value, str
-                    ):
-                        self.audited_tool_names.append(subnode.value.value)
-        self.generic_visit(node)
+__all__ = [
+    "AgentToolASTVisitor",
+    "evaluate_auditor_precision_recall",
+    "run_cross_layer_auditor",
+]
 
 
 def _optional_gemini_enrichment(prompt_context: str) -> str | None:
-    """Enrich architectural note via Gemini if GEMINI_API_KEY is configured."""
+    """Optionally enrich architectural note via Gemini if GEMINI_API_KEY is set."""
     load_dotenv()
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key or api_key == "your_gemini_api_key_here":
@@ -52,8 +29,8 @@ def _optional_gemini_enrichment(prompt_context: str) -> str | None:
         response = client.models.generate_content(
             model=model_name,
             contents=(
-                "Provide a one-sentence Cloud Architect root-cause summary for this "
-                f"Code-to-Cloud flaw: {prompt_context}"
+                "Provide a one-sentence Cloud Architect root-cause summary for "
+                f"this Code-to-Cloud flaw: {prompt_context}"
             ),
         )
         return response.text.strip() if response.text else None
@@ -63,20 +40,64 @@ def _optional_gemini_enrichment(prompt_context: str) -> str | None:
 
 def run_cross_layer_auditor(
     target_root: Path,
-    iam_risk_score: float,
+    iam_risk_score: float = 0.0,
+    service_rel_path: str = "benchmark_target/app/service.py",
 ) -> SubagentReport:
-    """Execute Subagent 02 combining Python AST inspection with IAM context."""
-    service_path = target_root / "benchmark_target" / "app" / "service.py"
-    rel_service = str(service_path.relative_to(target_root).as_posix())
-    source_code = service_path.read_text(encoding="utf-8")
+    """Execute Subagent 02 with layer-independent AST risk scoring."""
+    service_path = target_root / service_rel_path
+    rel_service = (
+        service_path.relative_to(target_root).as_posix()
+        if service_path.is_relative_to(target_root)
+        else service_rel_path
+    )
 
-    tree = ast.parse(source_code, filename=rel_service)
+    if not service_path.exists():
+        return SubagentReport(
+            subagent_name="Subagent 02: Cross-Layer Code-to-Cloud Auditor",
+            countered_defense_step="02 Scan (Multi-AI Code & Runtime Context Analysis)",
+            findings=[
+                Finding(
+                    finding_id="PARALLAX-AST-MISSING",
+                    layer=Layer.CODE_AST,
+                    severity=Severity.CRITICAL,
+                    title="Application Service Code Missing (Fail-Closed)",
+                    description=f"Expected source file {rel_service} was not found.",
+                    remediation_hint="Restore application handler source file.",
+                    file_path=rel_service,
+                )
+            ],
+            files_touched=[rel_service],
+            open_questions=[],
+            risk_score=1.0,
+        )
+
+    try:
+        source_code = service_path.read_text(encoding="utf-8")
+        tree = ast.parse(source_code, filename=rel_service)
+    except SyntaxError as exc:
+        return SubagentReport(
+            subagent_name="Subagent 02: Cross-Layer Code-to-Cloud Auditor",
+            countered_defense_step="02 Scan (Multi-AI Code & Runtime Context Analysis)",
+            findings=[
+                Finding(
+                    finding_id="PARALLAX-AST-SYNTAX",
+                    layer=Layer.CODE_AST,
+                    severity=Severity.CRITICAL,
+                    title="Application Code Syntax Error (Fail-Closed)",
+                    description=f"Failed to parse {rel_service}: {exc.msg}",
+                    remediation_hint="Fix Python syntax in candidate patch.",
+                    file_path=rel_service,
+                )
+            ],
+            files_touched=[rel_service],
+            open_questions=[],
+            risk_score=1.0,
+        )
+
     visitor = AgentToolASTVisitor()
     visitor.visit(tree)
 
     findings: list[Finding] = []
-    risk_score = 0.05
-
     has_unvalidated_fallback = (
         visitor.reads_fallback_param
         and visitor.overrides_effective_secret
@@ -101,23 +122,114 @@ def run_cross_layer_auditor(
                 title="Cross-Layer Confused Deputy via Unvalidated fallback_secret_id",
                 description=full_desc,
                 remediation_hint=(
-                    "Enforce ALLOWED_WORKSPACE_PREFIX validation on fallback_secret_id "
-                    "or remove the fallback_secret_id override."
+                    "Enforce ALLOWED_WORKSPACE_PREFIX validation on "
+                    "fallback_secret_id or remove the override."
                 ),
+                file_path=rel_service,
             )
         )
-        risk_score = 0.95 if iam_risk_score >= 0.8 else 0.65
+        risk_score = 0.95
+    else:
+        risk_score = 0.05
+
+    open_q = list(visitor.unresolved_dynamic_tool_sites)
+    if findings and not open_q:
+        open_q.append(
+            "If an IDE patch fixes or renames this tool handler without updating "
+            "Terraform or SecOps YAML, does it create a Split-Brain blind spot?"
+        )
 
     return SubagentReport(
         subagent_name="Subagent 02: Cross-Layer Code-to-Cloud Auditor",
         countered_defense_step="02 Scan (Multi-AI Code & Runtime Context Analysis)",
         findings=findings,
         files_touched=[rel_service],
-        open_questions=[
-            "If an IDE patch fixes or renames this tool handler without updating "
-            "Terraform or SecOps YAML, does it create a Split-Brain blind spot?"
-        ]
-        if findings
-        else [],
+        open_questions=open_q,
         risk_score=risk_score,
     )
+
+
+def evaluate_auditor_precision_recall() -> dict[str, float]:
+    """Run seeded true-positive and decoy AST cases to measure precision/recall."""
+    cases: list[tuple[str, bool]] = [
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    primary_id = payload.get('resource_id', '')",
+                    "    if not primary_id.startswith(ALLOWED_WORKSPACE_PREFIX):",
+                    "        raise PermissionError()",
+                    "    fallback_id = payload.get('fallback_secret_id', '')",
+                    "    effective_secret_id = fallback_id",
+                ]
+            ),
+            True,
+        ),
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    primary_id = payload['resource_id']",
+                    "    if primary_id.startswith(ALLOWED_WORKSPACE_PREFIX):",
+                    "        fallback_id = payload.get('fallback_secret_id', '')",
+                    "        if SAFE_ID_PATTERN.match(fallback_id):",
+                    "            effective_secret_id = fallback_id",
+                ]
+            ),
+            True,
+        ),
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    primary_id = payload.get('resource_id', '')",
+                    "    if not primary_id.startswith(ALLOWED_WORKSPACE_PREFIX):",
+                    "        raise PermissionError()",
+                    "    fallback_id = payload.get('fallback_secret_id', '')",
+                    "    if not fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX):",
+                    "        raise PermissionError()",
+                    "    effective_secret_id = fallback_id",
+                ]
+            ),
+            False,
+        ),
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    primary_id = payload.get('resource_id', '')",
+                    "    if not primary_id.startswith(ALLOWED_WORKSPACE_PREFIX):",
+                    "        raise PermissionError()",
+                    "    effective_secret_id = primary_id",
+                ]
+            ),
+            False,
+        ),
+    ]
+    tp = fp = tn = fn = 0
+    for code_snippet, expected_vulnerable in cases:
+        visitor = AgentToolASTVisitor()
+        visitor.visit(ast.parse(code_snippet))
+        predicted = (
+            visitor.reads_fallback_param
+            and visitor.overrides_effective_secret
+            and not visitor.revalidates_fallback_prefix
+        )
+        if predicted and expected_vulnerable:
+            tp += 1
+        elif predicted and not expected_vulnerable:
+            fp += 1
+        elif not predicted and not expected_vulnerable:
+            tn += 1
+        else:
+            fn += 1
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return {
+        "true_positives": float(tp),
+        "false_positives": float(fp),
+        "true_negatives": float(tn),
+        "false_negatives": float(fn),
+        "precision": round(precision, 2),
+        "recall": round(recall, 2),
+    }

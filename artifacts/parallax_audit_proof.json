@@ -1,15 +1,23 @@
 {
-  "generated_at_utc": "2026-10-31T20:16:27.302757+00:00",
-  "engine": "Project PARALLAX v0.1.0",
+  "generated_at_utc": "2026-11-01T05:56:35.328113+00:00",
+  "engine": "Project PARALLAX v0.2.0",
   "gemini_model": "gemini-2.5-flash",
+  "seeded_auditor_metrics": {
+    "true_positives": 2.0,
+    "false_positives": 0.0,
+    "true_negatives": 2.0,
+    "false_negatives": 0.0,
+    "precision": 1.0,
+    "recall": 1.0
+  },
   "verification_gates": {
-    "pytest": "8 passed, 1 xfailed",
-    "mypy_strict": "Success: no issues found in 13 source files",
+    "pytest": "15 passed, 1 xfailed (strict=True baseline proof)",
+    "mypy_strict": "Success: no issues found in 15 source files",
     "ruff_lint": "All checks passed!"
   },
   "orchestrator_report": {
     "project_codename": "Project PARALLAX",
-    "target_root": ".",
+    "target_root": "D:/AI EXPERIMENTS/Project PARALLAX",
     "subagent_reports": [
       {
         "subagent_name": "Subagent 01: Graph Analyzer",
@@ -21,7 +29,8 @@
             "severity": "CRITICAL",
             "title": "Public-to-Project IAM Escalation Path (roles/secretmanager.secretAccessor)",
             "description": "Project-wide Secret Manager access allows reading prod-* secrets. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:sa_agent_runner -> project_role:roles/secretmanager.secretAccessor",
-            "remediation_hint": "Replace google_project_iam_member with resource-scoped google_secret_manager_secret_iam_member."
+            "remediation_hint": "Replace google_project_iam_member with resource-scoped google_secret_manager_secret_iam_member.",
+            "file_path": ""
           },
           {
             "finding_id": "PARALLAX-IAM-002",
@@ -29,7 +38,8 @@
             "severity": "HIGH",
             "title": "Public-to-Project IAM Escalation Path (roles/iam.serviceAccountTokenCreator)",
             "description": "Project-wide Token Creator allows Non-Human Identity impersonation. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:sa_agent_runner -> project_role:roles/iam.serviceAccountTokenCreator",
-            "remediation_hint": "Replace google_project_iam_member with resource-scoped google_secret_manager_secret_iam_member."
+            "remediation_hint": "Replace google_project_iam_member with resource-scoped google_secret_manager_secret_iam_member.",
+            "file_path": ""
           }
         ],
         "files_touched": [
@@ -49,8 +59,9 @@
             "layer": "CODE_AST",
             "severity": "CRITICAL",
             "title": "Cross-Layer Confused Deputy via Unvalidated fallback_secret_id",
-            "description": "execute_agent_tool validates ALLOWED_WORKSPACE_PREFIX on primary_id, but overwrites effective_secret_id with fallback_secret_id without re-enforcing ALLOWED_WORKSPACE_PREFIX. [Gemini Note: The system validates `ALLOWED_WORKSPACE_PREFIX` only against the `primary_id`, failing to re-enforce this critical access control on the `effective_secret_id` after it's overwritten by a `fallback_secret_id`, leading to an authorization bypass.]",
-            "remediation_hint": "Enforce ALLOWED_WORKSPACE_PREFIX validation on fallback_secret_id or remove the fallback_secret_id override."
+            "description": "execute_agent_tool validates ALLOWED_WORKSPACE_PREFIX on primary_id, but overwrites effective_secret_id with fallback_secret_id without re-enforcing ALLOWED_WORKSPACE_PREFIX. [Gemini Note: The system performs `ALLOWED_WORKSPACE_PREFIX` validation on the initial `primary_id` but *fails to re-enforce* this crucial authorization policy after `effective_secret_id` is overwritten by a potentially unauthorized `fallback_secret_id`, enabling an authorization bypass.]",
+            "remediation_hint": "Enforce ALLOWED_WORKSPACE_PREFIX validation on fallback_secret_id or remove the override.",
+            "file_path": "benchmark_target/app/service.py"
           }
         ],
         "files_touched": [
@@ -79,19 +90,18 @@
           {
             "finding_id": "PARALLAX-WT-WT-SYMPTOM-PATCH",
             "layer": "PATCH_WORKTREE",
-            "severity": "HIGH",
+            "severity": "CRITICAL",
             "title": "Split-Brain AI Patch Divergence in 'wt-symptom-patch'",
-            "description": "[wt-symptom-patch] SPLIT-BRAIN REMEDIATION DETECTED: Fast patch left IaC Risk=0.95, Code Risk=0.05, Telemetry Drift Risk=0.85.",
-            "remediation_hint": "Coordinate code remediation with Terraform least-privilege IAM and SecOps rule synchronization before merging."
+            "description": "[wt-symptom-patch] SPLIT-BRAIN REMEDIATION DETECTED: Fast patch left IaC Risk=0.95 (d=+0.00), Code Risk=0.05 (d=-0.90), Telemetry Drift Risk=0.85 (d=+0.80).",
+            "remediation_hint": "Coordinate code remediation with Terraform least-privilege IAM and SecOps rule synchronization before merging.",
+            "file_path": "benchmark_target/app/service.py"
           }
         ],
         "files_touched": [
-          "benchmark_target/app/service.py",
-          "benchmark_target/infra/main.tf",
-          "benchmark_target/secops/rules.yaml"
+          "benchmark_target/app/service.py"
         ],
         "open_questions": [],
-        "risk_score": 0.615
+        "risk_score": 0.61
       },
       {
         "subagent_name": "Subagent 03: Worktree Patch Verifier (wt-architectural-patch)",
@@ -99,11 +109,10 @@
         "findings": [],
         "files_touched": [
           "benchmark_target/app/service.py",
-          "benchmark_target/infra/main.tf",
-          "benchmark_target/secops/rules.yaml"
+          "benchmark_target/infra/main.tf"
         ],
         "open_questions": [],
-        "risk_score": 0.0725
+        "risk_score": 0.07
       }
     ],
     "split_brain_evaluations": [
@@ -114,25 +123,58 @@
         "telemetry_blindspot_risk": 0.05,
         "effective_security_delta": 0.77,
         "split_brain_detected": false,
-        "summary": "[baseline-unpatched] Baseline unpatched state (Residual Index=0.77)."
+        "summary": "[baseline-unpatched] Baseline unpatched state (Residual Index=0.77).",
+        "patch_state": "NO_OP_BASELINE",
+        "before_iac_risk": 0.95,
+        "before_code_risk": 0.95,
+        "before_telemetry_risk": 0.05,
+        "delta_iac_risk": 0.0,
+        "delta_code_risk": 0.0,
+        "delta_telemetry_risk": 0.0,
+        "files_touched": [
+          "benchmark_target/app/service.py",
+          "benchmark_target/infra/main.tf",
+          "benchmark_target/secops/rules.yaml"
+        ]
       },
       {
         "patch_name": "wt-symptom-patch",
         "iac_reachability_risk": 0.95,
         "code_dataflow_risk": 0.05,
         "telemetry_blindspot_risk": 0.85,
-        "effective_security_delta": 0.615,
+        "effective_security_delta": 0.61,
         "split_brain_detected": true,
-        "summary": "[wt-symptom-patch] SPLIT-BRAIN REMEDIATION DETECTED: Fast patch left IaC Risk=0.95, Code Risk=0.05, Telemetry Drift Risk=0.85."
+        "summary": "[wt-symptom-patch] SPLIT-BRAIN REMEDIATION DETECTED: Fast patch left IaC Risk=0.95 (d=+0.00), Code Risk=0.05 (d=-0.90), Telemetry Drift Risk=0.85 (d=+0.80).",
+        "patch_state": "SPLIT_BRAIN_REMEDIATION",
+        "before_iac_risk": 0.95,
+        "before_code_risk": 0.95,
+        "before_telemetry_risk": 0.05,
+        "delta_iac_risk": 0.0,
+        "delta_code_risk": -0.9,
+        "delta_telemetry_risk": 0.8,
+        "files_touched": [
+          "benchmark_target/app/service.py"
+        ]
       },
       {
         "patch_name": "wt-architectural-patch",
         "iac_reachability_risk": 0.1,
         "code_dataflow_risk": 0.05,
         "telemetry_blindspot_risk": 0.05,
-        "effective_security_delta": 0.0725,
+        "effective_security_delta": 0.07,
         "split_brain_detected": false,
-        "summary": "[wt-architectural-patch] Full Root-Cause Architectural Remediation verified across Code AST, GCP Terraform IAM, and SecOps Telemetry."
+        "summary": "[wt-architectural-patch] Full Root-Cause Architectural Remediation verified across Code AST, GCP Terraform IAM, and SecOps Telemetry.",
+        "patch_state": "HOLISTIC_REMEDIATION",
+        "before_iac_risk": 0.95,
+        "before_code_risk": 0.95,
+        "before_telemetry_risk": 0.05,
+        "delta_iac_risk": -0.85,
+        "delta_code_risk": -0.9,
+        "delta_telemetry_risk": 0.0,
+        "files_touched": [
+          "benchmark_target/app/service.py",
+          "benchmark_target/infra/main.tf"
+        ]
       }
     ],
     "overall_posture": "CRITICAL_SPLIT_BRAIN_RISK_PROVEN"
