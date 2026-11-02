@@ -11,6 +11,7 @@ from parallax.orchestrator import (
 )
 from parallax.patch_verifier import (
     evaluate_directory_delta,
+    validate_base_ref,
     validate_worktree_path,
     verify_patch_in_git_worktree,
 )
@@ -29,64 +30,140 @@ def _copy_baseline_to_tmp(tmp_path: Path) -> None:
         dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def test_v2_path_traversal_rejected() -> None:
-    """Prove worktree path validator blocks '../' and absolute paths."""
+def test_v2_path_traversal_and_base_ref_option_injection_rejected() -> None:
+    """Prove worktree path and base_ref validators block unsafe inputs."""
     for unsafe_name in ("../escape", "..\\escape", "/root/evil", "bad/slash", ""):
         with pytest.raises(ValueError, match="Unsafe worktree_name"):
             validate_worktree_path(ROOT_DIR, unsafe_name)
 
+    for unsafe_ref in ("--upload-pack=evil", "-f", "--detach", ""):
+        with pytest.raises(ValueError, match="Unsafe base_ref"):
+            validate_base_ref(ROOT_DIR, unsafe_ref)
+
 
 def test_v2_true_before_after_delta_and_classifications(tmp_path: Path) -> None:
-    """Prove 5-state classification distinguishes no-op, split-brain, holistic."""
+    """Prove 5-state classification handles no-op on clean repo and regressions."""
     _copy_baseline_to_tmp(tmp_path)
 
-    noop_delta = evaluate_directory_delta(
-        tmp_path, "test-noop", baseline_scores=(0.95, 0.95, 0.05)
-    )
+    # 1. No-op patch on baseline (measured dynamically when baseline_scores omitted)
+    noop_delta = evaluate_directory_delta(tmp_path, "test-noop")
     assert noop_delta.patch_state == PatchClassification.NO_OP_BASELINE
     assert noop_delta.split_brain_detected is False
     assert noop_delta.delta_code_risk == 0.0
+    assert noop_delta.files_touched == []
 
-    apply_symptom_only_ide_patch(tmp_path)
-    already_patched_noop = evaluate_directory_delta(
-        tmp_path, "already-low-code", baseline_scores=(0.95, 0.05, 0.85)
-    )
-    assert already_patched_noop.patch_state == PatchClassification.NO_OP_BASELINE
-    assert already_patched_noop.split_brain_detected is False
-
-    symptom_delta = evaluate_directory_delta(
-        tmp_path, "test-symptom", baseline_scores=(0.95, 0.95, 0.05)
-    )
-    assert symptom_delta.patch_state == PatchClassification.SPLIT_BRAIN_REMEDIATION
-    assert symptom_delta.split_brain_detected is True
-    assert symptom_delta.delta_code_risk == -0.90
-    assert symptom_delta.delta_telemetry_risk > 0.0
-
-    _copy_baseline_to_tmp(tmp_path)
+    # 2. No-op patch on an ALREADY holistic clean repo -> NO_OP_BASELINE (not HOLISTIC!)
     apply_holistic_architectural_patch(tmp_path)
+    clean_noop = evaluate_directory_delta(
+        tmp_path, "already-clean-noop", baseline_scores=(0.10, 0.05, 0.05)
+    )
+    assert clean_noop.patch_state == PatchClassification.NO_OP_BASELINE
+    assert clean_noop.split_brain_detected is False
+
+    # 3. Holistic patch compared against vulnerable baseline -> HOLISTIC_REMEDIATION
     holistic_delta = evaluate_directory_delta(
         tmp_path, "test-holistic", baseline_scores=(0.95, 0.95, 0.05)
     )
     assert holistic_delta.patch_state == PatchClassification.HOLISTIC_REMEDIATION
     assert holistic_delta.split_brain_detected is False
 
+    # 4. Small code gain (-0.20) + large telemetry regression (+0.80) -> PURE_REGRESSION
+    _copy_baseline_to_tmp(tmp_path)
+    apply_symptom_only_ide_patch(tmp_path)
+    # Simulate a partial code state (0.75) by removing primary prefix check while
+    # keeping fallback read, plus broken telemetry (0.85)
+    svc_path = tmp_path / "benchmark_target" / "app" / "service.py"
+    svc_code = svc_path.read_text(encoding="utf-8").replace(
+        "if not primary_id.startswith(ALLOWED_WORKSPACE_PREFIX):",
+        "if False:",
+    )
+    svc_path.write_text(svc_code, encoding="utf-8")
+    reg_delta = evaluate_directory_delta(
+        tmp_path, "small-code-gain-big-reg", baseline_scores=(0.95, 0.95, 0.05)
+    )
+    assert reg_delta.delta_code_risk == -0.20
+    assert reg_delta.delta_telemetry_risk == 0.80
+    assert reg_delta.patch_state == PatchClassification.PURE_REGRESSION
 
-def test_v2_telemetry_fail_closed_on_deleted_or_corrupt_rules(
+
+def test_v2_telemetry_fail_closed_on_deleted_corrupt_or_missing_class(
     tmp_path: Path,
 ) -> None:
-    """Prove deleting or emptying rules.yaml scores 1.0 CRITICAL."""
+    """Prove deleting rules, corrupt syntax/YAML, or removing AuditEvent scores 1.0."""
     _copy_baseline_to_tmp(tmp_path)
     rules_path = tmp_path / "benchmark_target" / "secops" / "rules.yaml"
+    svc_path = tmp_path / "benchmark_target" / "app" / "service.py"
 
+    # Case A: Empty YAML file
     rules_path.write_text("", encoding="utf-8")
     empty_report = run_telemetry_validator(tmp_path)
     assert empty_report.risk_score == 1.0
-    assert empty_report.findings[0].severity == Severity.CRITICAL
+    assert empty_report.findings[0].finding_id == "TELEM_FAIL_CLOSED_EMPTY_RULES"
 
+    # Case B: Malformed YAML syntax (exercises TELEM_FAIL_CLOSED_CORRUPT_INPUT)
+    rules_path.write_text("rules: [unclosed_list\n", encoding="utf-8")
+    corrupt_yaml_report = run_telemetry_validator(tmp_path)
+    assert corrupt_yaml_report.risk_score == 1.0
+    assert (
+        corrupt_yaml_report.findings[0].finding_id == "TELEM_FAIL_CLOSED_CORRUPT_INPUT"
+    )
+
+    # Case C: Syntax error in service.py (exercises TELEM_FAIL_CLOSED_CORRUPT_INPUT)
+    _copy_baseline_to_tmp(tmp_path)
+    svc_path.write_text("def broken_syntax(\n", encoding="utf-8")
+    corrupt_py_report = run_telemetry_validator(tmp_path)
+    assert corrupt_py_report.risk_score == 1.0
+    assert corrupt_py_report.findings[0].finding_id == "TELEM_FAIL_CLOSED_CORRUPT_INPUT"
+
+    # Case D: AuditEvent class removed from service.py (fail-closed check)
+    _copy_baseline_to_tmp(tmp_path)
+    svc_no_class = svc_path.read_text(encoding="utf-8").replace(
+        "class AuditEvent(BaseModel):", "class LegacyEvent(BaseModel):"
+    )
+    svc_path.write_text(svc_no_class, encoding="utf-8")
+    no_class_report = run_telemetry_validator(tmp_path)
+    assert no_class_report.risk_score == 1.0
+    assert (
+        no_class_report.findings[0].finding_id
+        == "TELEM_FAIL_CLOSED_MISSING_AUDIT_CLASS"
+    )
+
+    # Case E: Deleted rules.yaml
     rules_path.unlink()
     deleted_report = run_telemetry_validator(tmp_path)
     assert deleted_report.risk_score == 1.0
     assert deleted_report.findings[0].finding_id == "TELEM_FAIL_CLOSED_MISSING_FILE"
+
+
+def test_v2_telemetry_malformed_rule_entries_and_duplicates(
+    tmp_path: Path,
+) -> None:
+    """Prove non-dict rules, null match blocks, and duplicate rule_ids are caught."""
+    _copy_baseline_to_tmp(tmp_path)
+    rules_path = tmp_path / "benchmark_target" / "secops" / "rules.yaml"
+    rules_path.write_text(
+        "\n".join(
+            [
+                "rules:",
+                '  - "not_a_dict_entry"',
+                "  - rule_id: 'SECOPS_DUP'",
+                "    severity: 'HIGH'",
+                "    match: null",
+                "  - rule_id: 'SECOPS_DUP'",
+                "    severity: 'CRITICAL'",
+                "    match:",
+                "      event_type: 'SECRET_MANAGER_ACCESS'",
+                "      tool_name: 'read_workspace_context'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    report = run_telemetry_validator(tmp_path)
+    f_ids = {f.finding_id for f in report.findings}
+    assert "TELEM_MALFORMED_RULE_ENTRY_1" in f_ids
+    assert "TELEM_INVALID_MATCH_SECOPS_DUP" in f_ids
+    assert "TELEM_DUPLICATE_RULE_ID_SECOPS_DUP" in f_ids
+    assert report.risk_score > 0.50
 
 
 def test_v2_telemetry_bidirectional_unmonitored_tool_and_dynamic_ast(
@@ -127,8 +204,7 @@ def test_v2_telemetry_bidirectional_unmonitored_tool_and_dynamic_ast(
     assert report.risk_score > 0.05
     finding_ids = {f.finding_id for f in report.findings}
     assert "TELEM_UNMONITORED_TOOL_EXPORT_BIGQUERY_DATASET" in finding_ids
-    assert len(report.open_questions) == 1
-    assert "dynamic AuditEvent.tool_name" in report.open_questions[0]
+    assert any("dynamic AuditEvent.tool_name" in q for q in report.open_questions)
 
 
 def test_v2_telemetry_proportional_scoring_and_field_drift(tmp_path: Path) -> None:
@@ -156,19 +232,21 @@ def test_v2_telemetry_proportional_scoring_and_field_drift(tmp_path: Path) -> No
 
 
 def test_v2_auditor_seeded_precision_and_recall() -> None:
-    """Prove deterministic AST auditor achieves 100% precision/recall on seeds."""
+    """Prove deterministic AST auditor achieves 100% precision/recall on 10 seeds."""
     metrics = evaluate_auditor_precision_recall()
+    assert metrics["total_cases"] == 10.0
     assert metrics["precision"] == 1.0
     assert metrics["recall"] == 1.0
 
 
-def test_v2_dynamic_files_touched_in_worktree() -> None:
-    """Prove worktree verifier reports only files actually touched by mutator."""
+def test_v2_dynamic_files_touched_and_clean_finding_id_in_worktree() -> None:
+    """Prove worktree verifier reports exact touched files and clean finding IDs."""
     symptom_delta, symptom_report = verify_patch_in_git_worktree(
         ROOT_DIR, "wt-v2-symptom", apply_symptom_only_ide_patch
     )
     assert symptom_report.files_touched == ["benchmark_target/app/service.py"]
     assert symptom_delta.files_touched == ["benchmark_target/app/service.py"]
+    assert symptom_report.findings[0].finding_id == "PARALLAX-WT-V2-SYMPTOM"
     assert symptom_report.findings[0].severity == Severity.CRITICAL
 
     _, arch_report = verify_patch_in_git_worktree(

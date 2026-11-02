@@ -19,21 +19,19 @@ from parallax.schemas import (
 )
 from parallax.telemetry_validator import run_telemetry_validator
 
+REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 WEIGHT_IAC: float = 0.45
 WEIGHT_CODE: float = 0.35
 WEIGHT_TELEMETRY: float = 0.20
 MIN_CODE_IMPROVEMENT: float = 0.30
+REGRESSION_TOLERANCE: float = 0.05
 HIGH_RISK_THRESHOLD: float = 0.70
 CLEAN_RISK_THRESHOLD: float = 0.20
 
 WORKTREE_NAME_PATTERN: re.Pattern[str] = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 )
-DEFAULT_BENCHMARK_FILES: list[str] = [
-    "benchmark_target/app/service.py",
-    "benchmark_target/infra/main.tf",
-    "benchmark_target/secops/rules.yaml",
-]
+BASE_REF_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/~^-]{0,127}$")
 
 
 def validate_worktree_path(repo_root: Path, worktree_name: str) -> Path:
@@ -50,6 +48,21 @@ def validate_worktree_path(repo_root: Path, worktree_name: str) -> Path:
             f"Path traversal blocked: '{candidate}' escapes '{worktrees_base}'."
         )
     return candidate
+
+
+def validate_base_ref(repo_root: Path, base_ref: str) -> str:
+    """Reject option-like refs starting with '-' and verify commit exists."""
+    if base_ref.startswith("-") or not BASE_REF_PATTERN.match(base_ref):
+        raise ValueError(
+            f"Unsafe base_ref '{base_ref}': must not start with '-' and must "
+            f"match {BASE_REF_PATTERN.pattern}"
+        )
+    proc = _run_git_command(
+        repo_root,
+        ["rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}"],
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 def _run_git_command(
@@ -75,10 +88,12 @@ def _run_git_command(
         ) from exc
 
 
-def _score_directory_layers(target_dir: Path) -> tuple[float, float, float]:
+def score_directory_layers(target_dir: Path) -> tuple[float, float, float]:
     """Compute independent (iac_risk, code_risk, telemetry_risk) for a tree."""
     iam_report = run_graph_analyzer(target_dir)
-    ast_report = run_cross_layer_auditor(target_dir, iam_report.risk_score)
+    ast_report = run_cross_layer_auditor(
+        target_dir, iam_report.risk_score, enable_llm_enrichment=False
+    )
     secops_report = run_telemetry_validator(target_dir)
     return (
         iam_report.risk_score,
@@ -87,11 +102,18 @@ def _score_directory_layers(target_dir: Path) -> tuple[float, float, float]:
     )
 
 
-def _detect_git_touched_files(wt_dir: Path) -> list[str]:
-    """Inspect git status --porcelain in worktree to list modified files."""
+def _detect_git_touched_files(wt_dir: Path) -> tuple[list[str], list[str]]:
+    """Inspect git status --porcelain in worktree without fake fallbacks."""
     proc = _run_git_command(wt_dir, ["status", "--porcelain", "-uall"], check=False)
     if proc.returncode != 0:
-        return list(DEFAULT_BENCHMARK_FILES)
+        err = (proc.stderr or "").strip()
+        return (
+            [],
+            [
+                f"git status --porcelain failed in worktree (rc={proc.returncode}): "
+                f"{err}. files_touched could not be observed."
+            ],
+        )
     touched: list[str] = []
     for raw_line in proc.stdout.splitlines():
         if len(raw_line) > 3:
@@ -99,7 +121,7 @@ def _detect_git_touched_files(wt_dir: Path) -> list[str]:
             if " -> " in path_part:
                 path_part = path_part.split(" -> ", maxsplit=1)[1].strip()
             touched.append(path_part)
-    return sorted(set(touched))
+    return sorted(set(touched)), []
 
 
 def evaluate_directory_delta(
@@ -109,10 +131,11 @@ def evaluate_directory_delta(
     files_touched: list[str] | None = None,
 ) -> SplitBrainDelta:
     """Compute before/after Split-Brain Security Delta across all 3 layers."""
-    before_iac, before_code, before_tel = (
-        baseline_scores if baseline_scores is not None else (0.95, 0.95, 0.05)
-    )
-    after_iac, after_code, after_tel = _score_directory_layers(worktree_root)
+    after_iac, after_code, after_tel = score_directory_layers(worktree_root)
+    if baseline_scores is not None:
+        before_iac, before_code, before_tel = baseline_scores
+    else:
+        before_iac, before_code, before_tel = score_directory_layers(REPO_ROOT)
 
     d_iac = round(after_iac - before_iac, 2)
     d_code = round(after_code - before_code, 2)
@@ -125,22 +148,39 @@ def evaluate_directory_delta(
         2,
     )
 
+    is_noop = d_iac == 0.0 and d_code == 0.0 and d_tel == 0.0
     code_improved = d_code <= -MIN_CODE_IMPROVEMENT and after_code < 0.50
+    any_layer_regressed = (
+        d_iac > REGRESSION_TOLERANCE
+        or d_code > REGRESSION_TOLERANCE
+        or d_tel > REGRESSION_TOLERANCE
+    )
     iac_unfixed = d_iac >= 0.0 and after_iac >= HIGH_RISK_THRESHOLD
-    telemetry_degraded = d_tel > 0.0 or after_tel >= HIGH_RISK_THRESHOLD
-    split_brain = code_improved and (iac_unfixed or telemetry_degraded)
-
-    if (
+    tel_unfixed_or_regressed = d_tel > REGRESSION_TOLERANCE or (
+        d_tel >= 0.0 and after_tel >= HIGH_RISK_THRESHOLD
+    )
+    all_clean = (
         after_iac < CLEAN_RISK_THRESHOLD
         and after_code < CLEAN_RISK_THRESHOLD
         and after_tel < CLEAN_RISK_THRESHOLD
-    ):
+    )
+
+    split_brain = False
+
+    if is_noop:
+        patch_state = PatchClassification.NO_OP_BASELINE
+        summary = (
+            f"[{patch_name}] No-op / baseline state "
+            f"(Residual Index={effective_delta:.2f})."
+        )
+    elif all_clean and not any_layer_regressed:
         patch_state = PatchClassification.HOLISTIC_REMEDIATION
         summary = (
             f"[{patch_name}] Full Root-Cause Architectural Remediation verified "
             "across Code AST, GCP Terraform IAM, and SecOps Telemetry."
         )
-    elif split_brain:
+    elif code_improved and (iac_unfixed or tel_unfixed_or_regressed):
+        split_brain = True
         patch_state = PatchClassification.SPLIT_BRAIN_REMEDIATION
         summary = (
             f"[{patch_name}] SPLIT-BRAIN REMEDIATION DETECTED: Fast patch left "
@@ -148,18 +188,11 @@ def evaluate_directory_delta(
             f"(d={d_code:+.2f}), Telemetry Drift Risk={after_tel:.2f} "
             f"(d={d_tel:+.2f})."
         )
-    elif d_iac == 0.0 and d_code == 0.0 and d_tel == 0.0:
-        patch_state = PatchClassification.NO_OP_BASELINE
-        summary = (
-            f"[{patch_name}] Baseline unpatched state "
-            f"(Residual Index={effective_delta:.2f})."
-        )
-    elif (d_iac > 0.0 or d_code > 0.0 or d_tel > 0.0) and d_code >= 0.0:
+    elif any_layer_regressed:
         patch_state = PatchClassification.PURE_REGRESSION
         summary = (
-            f"[{patch_name}] Security regression detected without code "
-            f"remediation (d_iac={d_iac:+.2f}, d_code={d_code:+.2f}, "
-            f"d_tel={d_tel:+.2f})."
+            f"[{patch_name}] Cross-layer security regression detected "
+            f"(d_iac={d_iac:+.2f}, d_code={d_code:+.2f}, d_tel={d_tel:+.2f})."
         )
     else:
         patch_state = PatchClassification.PARTIAL_REMEDIATION
@@ -169,9 +202,7 @@ def evaluate_directory_delta(
             f"d_tel={d_tel:+.2f})."
         )
 
-    observed_files = (
-        files_touched if files_touched is not None else list(DEFAULT_BENCHMARK_FILES)
-    )
+    observed_files = files_touched if files_touched is not None else []
 
     return SplitBrainDelta(
         patch_name=patch_name,
@@ -200,6 +231,7 @@ def verify_patch_in_git_worktree(
 ) -> tuple[SplitBrainDelta, SubagentReport]:
     """Create isolated git worktree, score before/after delta, and clean up."""
     base_wt_dir = validate_worktree_path(repo_root, worktree_name)
+    resolved_commit = validate_base_ref(repo_root, base_ref)
     base_wt_dir.parent.mkdir(parents=True, exist_ok=True)
     run_suffix = uuid.uuid4().hex[:8]
     wt_dir = base_wt_dir.parent / f"{worktree_name}-{run_suffix}"
@@ -211,13 +243,15 @@ def verify_patch_in_git_worktree(
         shutil.rmtree(wt_dir, ignore_errors=True)
 
     _run_git_command(
-        repo_root, ["worktree", "add", "--detach", str(wt_dir), base_ref], check=True
+        repo_root,
+        ["worktree", "add", "--detach", str(wt_dir), resolved_commit],
+        check=True,
     )
 
     try:
-        before_scores = _score_directory_layers(wt_dir)
+        before_scores = score_directory_layers(wt_dir)
         patch_mutator(wt_dir)
-        touched = _detect_git_touched_files(wt_dir)
+        touched, git_open_q = _detect_git_touched_files(wt_dir)
         delta = evaluate_directory_delta(
             wt_dir,
             patch_name=worktree_name,
@@ -225,10 +259,10 @@ def verify_patch_in_git_worktree(
             files_touched=touched,
         )
 
+        clean_id = re.sub(r"^WT[-_]", "", worktree_name.upper())
         findings: list[Finding] = []
-        if delta.split_brain_detected or (
-            delta.patch_state == PatchClassification.PURE_REGRESSION
-        ):
+
+        if delta.split_brain_detected:
             finding_sev = (
                 Severity.CRITICAL
                 if (
@@ -239,7 +273,7 @@ def verify_patch_in_git_worktree(
             )
             findings.append(
                 Finding(
-                    finding_id=f"PARALLAX-WT-{worktree_name.upper()}",
+                    finding_id=f"PARALLAX-WT-{clean_id}",
                     layer=Layer.PATCH_WORKTREE,
                     severity=finding_sev,
                     title=f"Split-Brain AI Patch Divergence in '{worktree_name}'",
@@ -247,6 +281,25 @@ def verify_patch_in_git_worktree(
                     remediation_hint=(
                         "Coordinate code remediation with Terraform least-privilege "
                         "IAM and SecOps rule synchronization before merging."
+                    ),
+                    file_path=touched[0] if touched else "benchmark_target/",
+                )
+            )
+        elif delta.patch_state == PatchClassification.PURE_REGRESSION:
+            reg_sev = (
+                Severity.CRITICAL
+                if delta.delta_telemetry_risk >= 0.50
+                else Severity.HIGH
+            )
+            findings.append(
+                Finding(
+                    finding_id=f"PARALLAX-REG-{clean_id}",
+                    layer=Layer.PATCH_WORKTREE,
+                    severity=reg_sev,
+                    title=f"Cross-Layer Security Regression in '{worktree_name}'",
+                    description=delta.summary,
+                    remediation_hint=(
+                        "Revert regression and validate telemetry/IAM contracts."
                     ),
                     file_path=touched[0] if touched else "benchmark_target/",
                 )
@@ -259,7 +312,7 @@ def verify_patch_in_git_worktree(
             ),
             findings=findings,
             files_touched=touched,
-            open_questions=[],
+            open_questions=git_open_q,
             risk_score=delta.effective_security_delta,
         )
         return delta, report

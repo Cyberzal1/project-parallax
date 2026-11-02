@@ -35,29 +35,36 @@ def _parse_severity(raw_sev: str) -> Severity:
     return Severity.HIGH
 
 
-def _replay_synthetic_attack_against_rule(
+def _evaluate_rule_against_emitted_samples(
     match_block: dict[str, Any],
-    emitted_tools: set[str],
-    emitted_event_types: set[str],
+    emitted_samples: list[dict[str, Any]],
     schema_fields: set[str],
 ) -> bool:
-    """Replay a synthetic prod-secret access event against a rule match block."""
-    valid_events = emitted_event_types or {"SECRET_MANAGER_ACCESS"}
-    for match_key, expected_val in match_block.items():
+    """Evaluate a rule match block against AST-extracted AuditEvent samples."""
+    if not emitted_samples or not schema_fields:
+        return False
+
+    for match_key in match_block:
         schema_field = RULE_MATCH_TO_SCHEMA_FIELD.get(match_key, match_key)
-        if schema_fields and schema_field not in schema_fields:
+        if schema_field not in schema_fields:
             return False
-        if match_key == "tool_name":
-            if str(expected_val) not in emitted_tools:
-                return False
-        elif match_key == "event_type":
-            if str(expected_val) not in valid_events:
-                return False
-        elif match_key == "target_secret_prefix" and not (
-            "prod-master-db".startswith(str(expected_val))
-        ):
-            return False
-    return True
+
+    for sample in emitted_samples:
+        sample_matches = True
+        for match_key, expected_val in match_block.items():
+            if match_key == "target_secret_prefix":
+                target_val = str(sample.get("target_secret", ""))
+                if not target_val.startswith(str(expected_val)):
+                    sample_matches = False
+                    break
+            else:
+                if sample.get(match_key) != expected_val:
+                    sample_matches = False
+                    break
+        if sample_matches:
+            return True
+
+    return False
 
 
 def run_telemetry_validator(
@@ -107,7 +114,9 @@ def run_telemetry_validator(
     try:
         tree = ast.parse(service_path.read_text(encoding="utf-8"), filename=rel_service)
         raw_yaml: Any = yaml.safe_load(rules_path.read_text(encoding="utf-8"))
-    except Exception as exc:
+        visitor = AgentToolASTVisitor()
+        visitor.visit(tree)
+    except (SyntaxError, yaml.YAMLError, UnicodeDecodeError, OSError) as exc:
         return SubagentReport(
             subagent_name="Subagent 04: Telemetry & SecOps Validator",
             countered_defense_step="04 Monitor (Machine-Speed Runtime Detection)",
@@ -168,12 +177,53 @@ def run_telemetry_validator(
             risk_score=1.0,
         )
 
-    visitor = AgentToolASTVisitor()
-    visitor.visit(tree)
-    emitted_tool_names = set(visitor.audited_tool_names)
-    emitted_event_types = visitor.emitted_event_types
     schema_fields = visitor.audit_event_fields
+    if not visitor.has_audit_event_class or not schema_fields:
+        return SubagentReport(
+            subagent_name="Subagent 04: Telemetry & SecOps Validator",
+            countered_defense_step="04 Monitor (Machine-Speed Runtime Detection)",
+            findings=[
+                Finding(
+                    finding_id="TELEM_FAIL_CLOSED_MISSING_AUDIT_CLASS",
+                    layer=Layer.SECOPS_TELEMETRY,
+                    severity=Severity.CRITICAL,
+                    title="AuditEvent Schema Class Removed or Empty (Fail-Closed)",
+                    description=(
+                        f"{rel_service} does not define a valid AuditEvent class "
+                        "with typed fields."
+                    ),
+                    remediation_hint="Restore AuditEvent model in service.py.",
+                    file_path=rel_service,
+                )
+            ],
+            files_touched=[rel_service, rel_rules],
+            open_questions=[],
+            risk_score=1.0,
+        )
 
+    if not visitor.emitted_event_samples:
+        return SubagentReport(
+            subagent_name="Subagent 04: Telemetry & SecOps Validator",
+            countered_defense_step="04 Monitor (Machine-Speed Runtime Detection)",
+            findings=[
+                Finding(
+                    finding_id="TELEM_FAIL_CLOSED_NO_EMISSION",
+                    layer=Layer.SECOPS_TELEMETRY,
+                    severity=Severity.CRITICAL,
+                    title="No AuditEvent Emission Sites Found in Code (Fail-Closed)",
+                    description=(
+                        f"{rel_service} never instantiates or emits AuditEvent."
+                    ),
+                    remediation_hint="Ensure execute_agent_tool emits AuditEvent.",
+                    file_path=rel_service,
+                )
+            ],
+            files_touched=[rel_service, rel_rules],
+            open_questions=[],
+            risk_score=1.0,
+        )
+
+    emitted_tool_names = set(visitor.audited_tool_names)
     findings: list[Finding] = []
     open_questions: list[str] = []
 
@@ -186,6 +236,7 @@ def run_telemetry_validator(
         )
 
     monitored_tool_names: set[str] = set()
+    seen_rule_ids: set[str] = set()
     total_weight = 0.0
     broken_weight = 0.0
 
@@ -193,6 +244,17 @@ def run_telemetry_validator(
         if not isinstance(rule_obj, dict):
             broken_weight += 1.0
             total_weight += 1.0
+            findings.append(
+                Finding(
+                    finding_id=f"TELEM_MALFORMED_RULE_ENTRY_{idx}",
+                    layer=Layer.SECOPS_TELEMETRY,
+                    severity=Severity.HIGH,
+                    title=f"Malformed Non-Dict Rule Entry at Index {idx}",
+                    description=f"Rule entry #{idx} in {rel_rules} is not a mapping.",
+                    remediation_hint="Format each rule in rules.yaml as a YAML map.",
+                    file_path=rel_rules,
+                )
+            )
             continue
 
         raw_id = str(rule_obj.get("rule_id", "")).strip()
@@ -200,6 +262,33 @@ def run_telemetry_validator(
         rule_sev = _parse_severity(str(rule_obj.get("severity", "HIGH")))
         weight = SEVERITY_WEIGHTS[rule_sev]
         total_weight += weight
+
+        if not raw_id:
+            findings.append(
+                Finding(
+                    finding_id=f"TELEM_MISSING_RULE_ID_{idx}",
+                    layer=Layer.SECOPS_TELEMETRY,
+                    severity=Severity.MEDIUM,
+                    title=f"SecOps Rule at Index {idx} Missing rule_id",
+                    description=f"Rule #{idx} does not declare a stable rule_id.",
+                    remediation_hint="Assign a unique rule_id to every SecOps rule.",
+                    file_path=rel_rules,
+                )
+            )
+        elif rule_id in seen_rule_ids:
+            broken_weight += weight
+            findings.append(
+                Finding(
+                    finding_id=f"TELEM_DUPLICATE_RULE_ID_{rule_id}",
+                    layer=Layer.SECOPS_TELEMETRY,
+                    severity=Severity.HIGH,
+                    title=f"Duplicate SecOps rule_id '{rule_id}'",
+                    description=f"Multiple rules share rule_id='{rule_id}'.",
+                    remediation_hint="Ensure every rule_id in rules.yaml is unique.",
+                    file_path=rel_rules,
+                )
+            )
+        seen_rule_ids.add(rule_id)
 
         match_block = rule_obj.get("match")
         if not isinstance(match_block, dict) or not match_block:
@@ -223,7 +312,7 @@ def run_telemetry_validator(
 
         for match_key in match_block:
             mapped_field = RULE_MATCH_TO_SCHEMA_FIELD.get(match_key, match_key)
-            if schema_fields and mapped_field not in schema_fields:
+            if mapped_field not in schema_fields:
                 rule_broken = True
                 findings.append(
                     Finding(
@@ -253,7 +342,7 @@ def run_telemetry_validator(
                     Finding(
                         finding_id=f"PARALLAX-SECOPS-{rule_id}",
                         layer=Layer.SECOPS_TELEMETRY,
-                        severity=Severity.HIGH,
+                        severity=rule_sev,
                         title=f"Silent SecOps Detection Drift on Rule {rule_id}",
                         description=(
                             f"SecOps rule {rule_id} monitors "
@@ -273,24 +362,25 @@ def run_telemetry_validator(
                 "event_type matching is intentional."
             )
 
-        if not rule_broken and not _replay_synthetic_attack_against_rule(
+        if not rule_broken and not _evaluate_rule_against_emitted_samples(
             match_block,
-            emitted_tool_names,
-            emitted_event_types,
+            visitor.emitted_event_samples,
             schema_fields,
         ):
             rule_broken = True
             findings.append(
                 Finding(
-                    finding_id=f"TELEM_REPLAY_FAIL_{rule_id}",
+                    finding_id=f"TELEM_CONTRACT_MISMATCH_{rule_id}",
                     layer=Layer.SECOPS_TELEMETRY,
                     severity=rule_sev,
-                    title=f"SecOps Rule {rule_id} Failed Synthetic Attack Replay",
+                    title=f"SecOps Rule {rule_id} Failed Emitted Event Evaluation",
                     description=(
-                        f"Rule {rule_id} did not fire when replaying a synthetic "
-                        "secret access event against emitted AuditEvent schemas."
+                        f"Rule {rule_id} predicates did not match any AST-extracted "
+                        "AuditEvent emission sample in service.py."
                     ),
-                    remediation_hint="Verify rule match predicates against replay.",
+                    remediation_hint=(
+                        "Align rule match predicates with emitted AuditEvent kwargs."
+                    ),
                     file_path=rel_rules,
                 )
             )

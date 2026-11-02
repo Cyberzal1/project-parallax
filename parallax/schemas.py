@@ -35,7 +35,7 @@ class PatchClassification(StrEnum):
 
 
 class Finding(BaseModel):
-    """Individual architectural or adversarial finding."""
+    """Individual deterministic architectural or adversarial finding."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -46,6 +46,7 @@ class Finding(BaseModel):
     description: str
     remediation_hint: str
     file_path: str = ""
+    llm_commentary: str | None = None
 
 
 class SubagentReport(BaseModel):
@@ -73,13 +74,13 @@ class SplitBrainDelta(BaseModel):
     effective_security_delta: float = Field(ge=0.0, le=1.0)
     split_brain_detected: bool
     summary: str
-    patch_state: PatchClassification = PatchClassification.NO_OP_BASELINE
-    before_iac_risk: float = Field(default=0.95, ge=0.0, le=1.0)
-    before_code_risk: float = Field(default=0.95, ge=0.0, le=1.0)
-    before_telemetry_risk: float = Field(default=0.05, ge=0.0, le=1.0)
-    delta_iac_risk: float = Field(default=0.0, ge=-1.0, le=1.0)
-    delta_code_risk: float = Field(default=0.0, ge=-1.0, le=1.0)
-    delta_telemetry_risk: float = Field(default=0.0, ge=-1.0, le=1.0)
+    patch_state: PatchClassification
+    before_iac_risk: float = Field(ge=0.0, le=1.0)
+    before_code_risk: float = Field(ge=0.0, le=1.0)
+    before_telemetry_risk: float = Field(ge=0.0, le=1.0)
+    delta_iac_risk: float = Field(ge=-1.0, le=1.0)
+    delta_code_risk: float = Field(ge=-1.0, le=1.0)
+    delta_telemetry_risk: float = Field(ge=-1.0, le=1.0)
     files_touched: list[str] = Field(default_factory=list)
 
 
