@@ -6,13 +6,12 @@ from parallax.orchestrator import run_parallax_orchestrator
 
 
 def main() -> None:
-    """Execute the 4-stage adversarial audit and Git worktree simulation."""
+    """Execute 4-stage audit and Git worktree simulation."""
     root = Path(__file__).resolve().parent.parent
-    sep = "=" * 64
-    print(sep)
+    print("============================================================")
     print("Project PARALLAX: Adversarial Cloud Architecture & Patch Engine")
-    print(sep)
-    print(f"Target Workspace: {root}")
+    print("============================================================")
+    print(f"Target Workspace: {root.name}")
     print("Executing 4-Stage Audit & Git Worktree Patch Simulation...\n")
 
     report = run_parallax_orchestrator(root, run_worktree_simulations=True)
@@ -21,15 +20,16 @@ def main() -> None:
     print(f"Total Subagent Reports: {len(report.subagent_reports)}")
     for sub in report.subagent_reports:
         print(
-            f"  - [{sub.subagent_name}] "
-            f"Risk: {sub.risk_score:.2f} | Findings: {len(sub.findings)}"
+            f"  - [{sub.subagent_name}] Risk: {sub.risk_score:.2f} | "
+            f"Findings: {len(sub.findings)}"
         )
 
     print("\n--- Split-Brain Remediation Evaluation (Git Worktrees) ---")
     for delta in report.split_brain_evaluations:
         print(f"  * Patch Worktree: {delta.patch_name}")
-        print(f"    Effective Security Delta : {delta.effective_security_delta:.2f}")
+        print(f"    Weighted Residual Risk   : {delta.weighted_residual_risk:.2f}")
         print(f"    Split-Brain Detected     : {delta.split_brain_detected}")
+        print(f"    Classification           : {delta.patch_state.value}")
         print(f"    Summary                  : {delta.summary}\n")
 
 

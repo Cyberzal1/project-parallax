@@ -19,7 +19,6 @@ from parallax.schemas import (
 )
 from parallax.telemetry_validator import run_telemetry_validator
 
-REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 WEIGHT_IAC: float = 0.45
 WEIGHT_CODE: float = 0.35
 WEIGHT_TELEMETRY: float = 0.20
@@ -103,45 +102,67 @@ def score_directory_layers(target_dir: Path) -> tuple[float, float, float]:
 
 
 def _detect_git_touched_files(wt_dir: Path) -> tuple[list[str], list[str]]:
-    """Inspect git status --porcelain in worktree without fake fallbacks."""
-    proc = _run_git_command(wt_dir, ["status", "--porcelain", "-uall"], check=False)
+    """Parse git status --porcelain -z (NUL-delimited) for spaces/Unicode."""
+    proc = _run_git_command(
+        wt_dir, ["status", "--porcelain", "-z", "-uall"], check=False
+    )
     if proc.returncode != 0:
         err = (proc.stderr or "").strip()
         return (
             [],
             [
-                f"git status --porcelain failed in worktree (rc={proc.returncode}): "
+                f"git status --porcelain -z failed (rc={proc.returncode}): "
                 f"{err}. files_touched could not be observed."
             ],
         )
     touched: list[str] = []
-    for raw_line in proc.stdout.splitlines():
-        if len(raw_line) > 3:
-            path_part = raw_line[3:].strip().replace("\\", "/")
-            if " -> " in path_part:
-                path_part = path_part.split(" -> ", maxsplit=1)[1].strip()
+    entries = proc.stdout.split("\0")
+    idx = 0
+    while idx < len(entries):
+        entry = entries[idx]
+        if len(entry) > 3:
+            status_xy = entry[:2]
+            path_part = entry[3:].replace("\\", "/")
             touched.append(path_part)
+            if "R" in status_xy or "C" in status_xy:
+                idx += 1
+        idx += 1
     return sorted(set(touched)), []
+
+
+def _select_finding_file_path(delta: SplitBrainDelta) -> str:
+    """Point finding file_path at the specific layer that regressed/stayed open."""
+    if delta.delta_telemetry_risk > REGRESSION_TOLERANCE:
+        return "benchmark_target/secops/rules.yaml"
+    if (
+        delta.delta_iac_risk > REGRESSION_TOLERANCE
+        or delta.iac_reachability_risk >= HIGH_RISK_THRESHOLD
+    ):
+        return "benchmark_target/infra/main.tf"
+    if delta.delta_code_risk > REGRESSION_TOLERANCE:
+        return "benchmark_target/app/service.py"
+    return (
+        delta.files_touched[0]
+        if delta.files_touched
+        else "benchmark_target/app/service.py"
+    )
 
 
 def evaluate_directory_delta(
     worktree_root: Path,
     patch_name: str,
-    baseline_scores: tuple[float, float, float] | None = None,
+    baseline_scores: tuple[float, float, float],
     files_touched: list[str] | None = None,
 ) -> SplitBrainDelta:
-    """Compute before/after Split-Brain Security Delta across all 3 layers."""
+    """Compute before/after Split-Brain Security Delta with required baseline."""
+    before_iac, before_code, before_tel = baseline_scores
     after_iac, after_code, after_tel = score_directory_layers(worktree_root)
-    if baseline_scores is not None:
-        before_iac, before_code, before_tel = baseline_scores
-    else:
-        before_iac, before_code, before_tel = score_directory_layers(REPO_ROOT)
 
     d_iac = round(after_iac - before_iac, 2)
     d_code = round(after_code - before_code, 2)
     d_tel = round(after_tel - before_tel, 2)
 
-    effective_delta = round(
+    residual_risk = round(
         (after_iac * WEIGHT_IAC)
         + (after_code * WEIGHT_CODE)
         + (after_tel * WEIGHT_TELEMETRY),
@@ -150,6 +171,7 @@ def evaluate_directory_delta(
 
     is_noop = d_iac == 0.0 and d_code == 0.0 and d_tel == 0.0
     code_improved = d_code <= -MIN_CODE_IMPROVEMENT and after_code < 0.50
+    minor_code_gain = -MIN_CODE_IMPROVEMENT < d_code < -REGRESSION_TOLERANCE
     any_layer_regressed = (
         d_iac > REGRESSION_TOLERANCE
         or d_code > REGRESSION_TOLERANCE
@@ -171,7 +193,7 @@ def evaluate_directory_delta(
         patch_state = PatchClassification.NO_OP_BASELINE
         summary = (
             f"[{patch_name}] No-op / baseline state "
-            f"(Residual Index={effective_delta:.2f})."
+            f"(Residual Risk={residual_risk:.2f})."
         )
     elif all_clean and not any_layer_regressed:
         patch_state = PatchClassification.HOLISTIC_REMEDIATION
@@ -188,17 +210,24 @@ def evaluate_directory_delta(
             f"(d={d_code:+.2f}), Telemetry Drift Risk={after_tel:.2f} "
             f"(d={d_tel:+.2f})."
         )
+    elif any_layer_regressed and minor_code_gain:
+        patch_state = PatchClassification.MIXED_REGRESSION
+        summary = (
+            f"[{patch_name}] Mixed regression: minor code gain with cross-layer "
+            f"regression (d_iac={d_iac:+.2f}, d_code={d_code:+.2f}, "
+            f"d_tel={d_tel:+.2f})."
+        )
     elif any_layer_regressed:
         patch_state = PatchClassification.PURE_REGRESSION
         summary = (
-            f"[{patch_name}] Cross-layer security regression detected "
+            f"[{patch_name}] Pure security regression detected "
             f"(d_iac={d_iac:+.2f}, d_code={d_code:+.2f}, d_tel={d_tel:+.2f})."
         )
     else:
         patch_state = PatchClassification.PARTIAL_REMEDIATION
         summary = (
-            f"[{patch_name}] Partial remediation (Residual Index="
-            f"{effective_delta:.2f}, d_iac={d_iac:+.2f}, d_code={d_code:+.2f}, "
+            f"[{patch_name}] Partial remediation (Residual Risk="
+            f"{residual_risk:.2f}, d_iac={d_iac:+.2f}, d_code={d_code:+.2f}, "
             f"d_tel={d_tel:+.2f})."
         )
 
@@ -209,7 +238,7 @@ def evaluate_directory_delta(
         iac_reachability_risk=after_iac,
         code_dataflow_risk=after_code,
         telemetry_blindspot_risk=after_tel,
-        effective_security_delta=effective_delta,
+        weighted_residual_risk=residual_risk,
         split_brain_detected=split_brain,
         summary=summary,
         patch_state=patch_state,
@@ -236,12 +265,6 @@ def verify_patch_in_git_worktree(
     run_suffix = uuid.uuid4().hex[:8]
     wt_dir = base_wt_dir.parent / f"{worktree_name}-{run_suffix}"
 
-    if wt_dir.exists():
-        _run_git_command(
-            repo_root, ["worktree", "remove", "--force", str(wt_dir)], check=False
-        )
-        shutil.rmtree(wt_dir, ignore_errors=True)
-
     _run_git_command(
         repo_root,
         ["worktree", "add", "--detach", str(wt_dir), resolved_commit],
@@ -261,12 +284,13 @@ def verify_patch_in_git_worktree(
 
         clean_id = re.sub(r"^WT[-_]", "", worktree_name.upper())
         findings: list[Finding] = []
+        target_file_path = _select_finding_file_path(delta)
 
         if delta.split_brain_detected:
             finding_sev = (
                 Severity.CRITICAL
                 if (
-                    delta.delta_telemetry_risk > 0.0
+                    delta.delta_telemetry_risk > REGRESSION_TOLERANCE
                     and delta.iac_reachability_risk >= 0.80
                 )
                 else Severity.HIGH
@@ -282,10 +306,13 @@ def verify_patch_in_git_worktree(
                         "Coordinate code remediation with Terraform least-privilege "
                         "IAM and SecOps rule synchronization before merging."
                     ),
-                    file_path=touched[0] if touched else "benchmark_target/",
+                    file_path=target_file_path,
                 )
             )
-        elif delta.patch_state == PatchClassification.PURE_REGRESSION:
+        elif delta.patch_state in (
+            PatchClassification.PURE_REGRESSION,
+            PatchClassification.MIXED_REGRESSION,
+        ):
             reg_sev = (
                 Severity.CRITICAL
                 if delta.delta_telemetry_risk >= 0.50
@@ -301,7 +328,7 @@ def verify_patch_in_git_worktree(
                     remediation_hint=(
                         "Revert regression and validate telemetry/IAM contracts."
                     ),
-                    file_path=touched[0] if touched else "benchmark_target/",
+                    file_path=target_file_path,
                 )
             )
 
@@ -313,7 +340,7 @@ def verify_patch_in_git_worktree(
             findings=findings,
             files_touched=touched,
             open_questions=git_open_q,
-            risk_score=delta.effective_security_delta,
+            risk_score=delta.weighted_residual_risk,
         )
         return delta, report
     finally:

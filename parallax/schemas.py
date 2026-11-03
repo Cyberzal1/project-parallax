@@ -25,12 +25,13 @@ class Layer(StrEnum):
 
 
 class PatchClassification(StrEnum):
-    """Explicit 5-state classification for candidate worktree patches."""
+    """Explicit 6-state classification for candidate worktree patches."""
 
     NO_OP_BASELINE = "NO_OP_BASELINE"
     SPLIT_BRAIN_REMEDIATION = "SPLIT_BRAIN_REMEDIATION"
     HOLISTIC_REMEDIATION = "HOLISTIC_REMEDIATION"
     PARTIAL_REMEDIATION = "PARTIAL_REMEDIATION"
+    MIXED_REGRESSION = "MIXED_REGRESSION"
     PURE_REGRESSION = "PURE_REGRESSION"
 
 
@@ -71,7 +72,7 @@ class SplitBrainDelta(BaseModel):
     iac_reachability_risk: float = Field(ge=0.0, le=1.0)
     code_dataflow_risk: float = Field(ge=0.0, le=1.0)
     telemetry_blindspot_risk: float = Field(ge=0.0, le=1.0)
-    effective_security_delta: float = Field(ge=0.0, le=1.0)
+    weighted_residual_risk: float = Field(ge=0.0, le=1.0)
     split_brain_detected: bool
     summary: str
     patch_state: PatchClassification
@@ -82,6 +83,11 @@ class SplitBrainDelta(BaseModel):
     delta_code_risk: float = Field(ge=-1.0, le=1.0)
     delta_telemetry_risk: float = Field(ge=-1.0, le=1.0)
     files_touched: list[str] = Field(default_factory=list)
+
+    @property
+    def effective_security_delta(self) -> float:
+        """Backward-compatible alias for weighted_residual_risk."""
+        return self.weighted_residual_risk
 
 
 class OrchestratorReport(BaseModel):

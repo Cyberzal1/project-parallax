@@ -66,8 +66,12 @@ resource "google_cloud_run_v2_service" "vertex_ops_agent" {
   }
 }
 
-resource "google_secret_manager_secret_iam_member" "scoped_workspace_secret" {
+resource "google_secret_manager_secret" "workspace_doc_context" {
   secret_id = "workspace-doc-context"
+}
+
+resource "google_secret_manager_secret_iam_member" "scoped_workspace_secret" {
+  secret_id = google_secret_manager_secret.workspace_doc_context.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.sa_agent_runner.email}"
 }

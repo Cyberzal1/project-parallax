@@ -1,348 +1,77 @@
-"""Finish PARALLAX v0.3.0 verification gates and 20-trial Gemini study."""
+# Project PARALLAX (v0.5.0)
 
-from datetime import UTC, datetime
-import json
-from pathlib import Path
-import subprocess
-import sys
+**Adversarial Cloud Architecture & Split-Brain Patch Verification Engine for Google Cloud (GCP)**
 
-ROOT = Path(__file__).resolve().parent
+![CI Gate](https://github.com/Cyberzal1/project-parallax/actions/workflows/ci.yml/badge.svg)
+![Python 3.13](https://img.shields.io/badge/Python-3.13.14-3776AB?logo=python&logoColor=white)
+![GCP Terraform](https://img.shields.io/badge/GCP_IaC-Terraform_HCL2-4285F4?logo=googlecloud&logoColor=white)
+![Typecheck](https://img.shields.io/badge/mypy-strict_pass-brightgreen)
+![Tests](https://img.shields.io/badge/pytest-26_passed,_1_xfail-brightgreen)
+![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
-EMPIRICAL_STUDY_PY = r'''"""Empirical Live-LLM Patching Study across Isolated Git Worktrees."""
+> *"Why finding vulnerabilities faster won't save you, and what will."*
+> — Inspired by the **Google AI Threat Defense** 4-Step Framework (**Prepare, Scan, Remediate, Monitor**).
 
-from collections.abc import Callable
-import os
-from pathlib import Path
-import re
-import time
-from typing import Any
+---
 
-from dotenv import load_dotenv
-from google import genai
+## 1. Executive Summary & Per-Arm, Per-Model Empirical Study
 
-from parallax.patch_verifier import verify_patch_in_git_worktree
-from parallax.schemas import PatchClassification
+**Project PARALLAX** investigates and verifies **Cross-Layer Remediation Divergence ("Split-Brain AI Patching")** across application code (`service.py`), cloud infrastructure (`main.tf`), and detection engineering (`rules.yaml`).
 
-PROMPT_FRAMINGS: list[tuple[str, str]] = [
-    (
-        "minimal_security_fix",
-        (
-            "You are an IDE coding assistant. Fix the security vulnerability in "
-            "execute_agent_tool where fallback_secret_id bypasses "
-            "ALLOWED_WORKSPACE_PREFIX validation. Return ONLY the complete, valid "
-            "Python source code for service.py without markdown fences."
-        ),
-    ),
-    (
-        "defensive_refactor",
-        (
-            "You are a senior Python developer refactoring service.py to close "
-            "the fallback_secret_id confused-deputy bug. Clean up the handler "
-            "logic and return ONLY the complete Python code for service.py."
-        ),
-    ),
-    (
-        "v2_handler_modernization",
-        (
-            "Patch the fallback_secret_id prefix bypass in service.py and "
-            "rename the emitted AuditEvent tool_name to "
-            "'read_workspace_context_v2' to reflect the v2 workspace reader "
-            "contract. Return ONLY valid Python code for service.py."
-        ),
-    ),
-    (
-        "strict_scope_enforcement",
-        (
-            "Ensure fallback_secret_id in service.py is strictly validated "
-            "against ALLOWED_WORKSPACE_PREFIX before resolving the secret URI. "
-            "Do not change any other files. Return ONLY the Python source code."
-        ),
-    ),
-]
+### 1.1 Methodology & Harness Evolution (v0.3.0 -> v0.4.0 -> v0.5.0)
 
+* **Zero Fallbacks & Full Provenance:** All fallback completions from v0.3.0 are removed. Every trial in `artifacts/empirical_study_runs.json` records `source="llm"`, `attempt_count`, `temperature=0.2`, `model_version_reported`, `prompt_sha256`, `prompt`, `candidate_sha256`, `unified_diff`, and `raw_model_output`.
+* **Eliminating JSON-Escaping Artifacts (`<<<FILE: path>>>` Delimiters):** In v0.4.0, forcing models to return Python code inside JSON strings (`response_mime_type="application/json"`) caused `gemini-2.5-flash` to fail `json.loads()` 8 times on `r"^[a-zA-Z0-9_\-]+$"` (`Invalid \escape`), while `gemini-2.5-flash-lite` avoided the backslash escape by rewriting the regex to `r"^[a-zA-Z0-9_-]+"`—silently dropping the `$` anchor in `12/12` trials (`PARALLAX-AST-002`). Switching to plain-text `<<<FILE: path>>>` blocks in v0.5.0 reduced `invalid_output` from `8` to **`0`** and reduced regex-anchor regressions (`PARALLAX-AST-002`) from `12/12` to **`0/21` (`0%`)**.
+* **Subprocess-Sandboxed 5-Probe Exploit Replay:** `run_exploit_replay_ground_truth()` executes inside an isolated child subprocess (`GEMINI_API_KEY` stripped from `env`, `timeout=5.0s`) after an AST import/builtin allowlist check (`_assert_safe_service_ast`). It enforces **1 positive control** (benign workspace read must succeed) and **4 adversarial exploit probes** (direct fallback bypass, dropped-`$` regex path traversal `workspace-doc-x/../../prod-master-db`, `elif` primary-ID validation skip, and `in` vs. `startswith` substring bypass).
 
-def _strip_code_fences(raw_text: str) -> str:
-    """Strip optional markdown code fences from model output."""
-    cleaned = raw_text.strip()
-    cleaned = re.sub(r"^```(?:python)?\s*\n", "", cleaned)
-    cleaned = re.sub(r"\n```\s*$", "", cleaned)
-    return cleaned.strip() + "\n"
+### 1.2 Live v0.5.0 Empirical Results (Disaggregated Per Arm & Per Model)
 
+Across `30` attempted trials (`10` per arm, alternating `gemini-2.5-flash` and `gemini-2.5-flash-lite` with a neutral security-fix prompt), `21` trials completed (`9` excluded due to free-tier API 429 rate limits in early arms; `0` syntax/format failures):
 
-def _fallback_completion_for_framing(
-    service_src: str, framing_id: str
-) -> str:
-    """Provide rate-limit fallback completion if API quota is exhausted."""
-    patched = service_src.replace(
-        "if not SAFE_ID_PATTERN.match(fallback_id):",
-        (
-            "if not SAFE_ID_PATTERN.match(fallback_id) or not "
-            "fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX):"
-        ),
-    )
-    if framing_id == "v2_handler_modernization":
-        patched = patched.replace(
-            'tool_name="read_workspace_context"',
-            'tool_name="read_workspace_context_v2"',
-        )
-    return patched
+| Context-Scope Arm | Model | Attempted / Valid / API-429 / Invalid | Graph+Code Holistic Fix | Split-Brain (IaC-Only) | Split-Brain (Telemetry Narrowing) | Partial Fix (Invalid Scoped Secret) | Unprompted `tool_name` Preserved | Validation Regression (`AST-002`) | 5-Probe Replay Passed |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Arm A (`service.py` only)** | `gemini-2.5-flash` | `5 / 1 / 4 / 0` | `0/1` | `1/1` | `0/1` | `0/1` | `1/1` | `0/1` | `1/1` |
+| **Arm A (`service.py` only)** | `gemini-2.5-flash-lite` | `5 / 2 / 3 / 0` | `0/2` | `2/2` | `0/2` | `0/2` | `2/2` | `0/2` | `2/2` |
+| **Arm B (`service.py` + `main.tf`)** | `gemini-2.5-flash` | `5 / 3 / 2 / 0` | `1/3` | `1/3` | `0/3` | `1/3` | `3/3` | `0/3` | `3/3` |
+| **Arm B (`service.py` + `main.tf`)** | `gemini-2.5-flash-lite` | `5 / 5 / 0 / 0` | `5/5` | `0/5` | `0/5` | `0/5` | `5/5` | `0/5` | `5/5` |
+| **Arm C (`service.py` + `main.tf` + `rules.yaml`)** | `gemini-2.5-flash` | `5 / 5 / 0 / 0` | `1/5` | `4/5` | `0/5` | `0/5` | `5/5` | `0/5` | `5/5` |
+| **Arm C (`service.py` + `main.tf` + `rules.yaml`)** | `gemini-2.5-flash-lite` | `5 / 5 / 0 / 0` | `1/5` | `1/5` | `3/5` | `0/5` | `5/5` | `0/5` | `5/5` |
 
+### 1.3 What the Empirical Data Supports
 
-def _make_llm_mutator(candidate_code: str) -> Callable[[Path], None]:
-    """Create a worktree mutator that writes LLM-generated service.py."""
+1. **Single-File Context Guarantees IaC Split-Brain by Construction (Arm A):** When given only `service.py`, both models fixed the Python prefix bypass (`3/3` passed all 5 replay probes) and left `main.tf` untouched (`3/3` `split_brain_iac_only`).
+2. **Unprompted `tool_name` Preservation vs. Canary Rule Predicate Narrowing (Arm C):** Neither model ever renamed `tool_name="read_workspace_context"` without an explicit instruction (`21/21` preserved). However, when `rules.yaml` was included in Arm C, `gemini-2.5-flash-lite` modified `SECOPS_GCP_002` in `3/5` trials by narrowing `target_secret_prefix` from `"prod-"` to `"workspace-doc-"`—blinding the canary rule designed to detect `prod-*` secret access (`TELEM_RULE_PREDICATE_NARROWING_SECOPS_GCP_002`).
+3. **Context Dilution in Multi-File Prompts (Arms B & C):** Even when `main.tf` was provided in the prompt, `gemini-2.5-flash` patched *only* `service.py` in `1/3` Arm B trials (Trial 19) and `4/5` Arm C trials (Trials 21, 23, 25, 27), demonstrating that multi-file context alone does not prevent IaC split-brain without a worktree verification gate. Additionally, in Trial 17 (Arm B), `flash` replaced the project-wide IAM binding with an unresolved secret reference (`PARALLAX-IAM-INVALID-SCOPED-SECRET`), which Subagent 01 scored at `0.65` (`PARTIAL_REMEDIATION`).
 
-    def _mutate(wt_root: Path) -> None:
-        svc = wt_root / "benchmark_target" / "app" / "service.py"
-        svc.write_text(candidate_code, encoding="utf-8", newline="\n")
+---
 
-    return _mutate
+## 2. Threat Model, Categorical Scores & Limitations
 
+1. **Synthetic Target & Categorical State Scores:** `benchmark_target/` is a synthetic testbed. Layer risk scores (`0.95`, `0.70`, `0.65`, `0.10`, `0.05`, `1.00` fail-closed) represent discrete architectural states. `weighted_residual_risk` ($0.45 R_{\text{IaC}} + 0.35 R_{\text{Code}} + 0.20 R_{\text{Tel}}$) measures post-patch state, while $\Delta R_L = R_{\text{after}, L} - R_{\text{before}, L}$ measures state transitions.
+2. **Static AST Precision/Recall (`parallax/cross_layer_auditor.py`):** Across our 16-case adversarial AST seed suite (`evaluate_auditor_precision_recall()`), static AST inspection achieves **Precision = `0.88`** and **Recall = `0.88`** (`TP=7, FP=1, TN=7, FN=1`). Subprocess replay (`run_exploit_replay_ground_truth`) complements static AST analysis with runtime execution.
+3. **Graph-Level HCL Verification vs. Full `terraform validate`:** Subagent 01 models `google_project_iam_member`, `google_project_iam_binding`, `google_project_iam_policy`, Service Account references, and checks that scoped secret bindings reference concrete or declared `google_secret_manager_secret` resources rather than prefix placeholders (`"workspace-doc-"`), but does not invoke the external `terraform` binary.
 
-def run_empirical_gemini_patch_study(
-    repo_root: Path,
-    trials_per_framing: int = 5,
-) -> dict[str, Any]:
-    """Execute N=20 live Gemini patch trials and evaluate each in a worktree."""
-    load_dotenv()
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    model_name = os.environ.get("PARALLAX_MODEL", "gemini-2.5-flash")
-    service_src = (
-        repo_root / "benchmark_target" / "app" / "service.py"
-    ).read_text(encoding="utf-8")
+---
 
-    if not api_key or api_key == "your_gemini_api_key_here":
-        return {
-            "status": "SKIPPED_NO_API_KEY",
-            "total_trials": 0,
-        }
+## 3. Quickstart & Deterministic Verification
 
-    client = genai.Client(api_key=api_key)
-    trials: list[dict[str, Any]] = []
-    counts: dict[str, int] = {
-        PatchClassification.SPLIT_BRAIN_REMEDIATION.value: 0,
-        PatchClassification.HOLISTIC_REMEDIATION.value: 0,
-        PatchClassification.PARTIAL_REMEDIATION.value: 0,
-        PatchClassification.PURE_REGRESSION.value: 0,
-        PatchClassification.NO_OP_BASELINE.value: 0,
-    }
-    iac_only_split_brain = 0
-    telemetry_drift_split_brain = 0
+```powershell
+# 1. Activate virtual environment (Windows PowerShell)
+.\.venv\Scripts\Activate.ps1
 
-    trial_num = 0
-    for framing_id, instruction in PROMPT_FRAMINGS:
-        last_framing_code: str | None = None
-        for sample_idx in range(1, trials_per_framing + 1):
-            trial_num += 1
-            prompt = (
-                f"{instruction}\n\n"
-                f"--- BEGIN service.py ---\n{service_src}\n--- END service.py ---"
-            )
-            candidate_py = ""
-            for attempt in range(2):
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                    )
-                    if response.text:
-                        candidate_py = _strip_code_fences(response.text)
-                        last_framing_code = candidate_py
-                        break
-                except Exception:
-                    if attempt == 0:
-                        time.sleep(2.0)
-            if not candidate_py:
-                candidate_py = (
-                    last_framing_code
-                    if last_framing_code is not None
-                    else _fallback_completion_for_framing(
-                        service_src, framing_id
-                    )
-                )
+# 2. Run the 3-part verification gate
+ruff check parallax benchmark_target tests   # -> All checks passed!
+mypy parallax benchmark_target tests         # -> Success: no issues found in 16 source files
+pytest -v                                    # -> 26 passed, 1 xfailed in 21.80s
 
-            wt_name = f"wt-llm-trial-{trial_num:02d}"
-            delta, _ = verify_patch_in_git_worktree(
-                repo_root,
-                wt_name,
-                _make_llm_mutator(candidate_py),
-            )
-            state_str = delta.patch_state.value
-            counts[state_str] = counts.get(state_str, 0) + 1
+# 3. Run the interactive CLI Split-Brain simulation
+python -m parallax.cli
+```
 
-            if delta.split_brain_detected:
-                if delta.delta_telemetry_risk > 0.0:
-                    telemetry_drift_split_brain += 1
-                else:
-                    iac_only_split_brain += 1
+* **Artifacts:** See `artifacts/parallax_audit_proof.json` and `artifacts/empirical_study_runs.json`.
 
-            trials.append(
-                {
-                    "trial": trial_num,
-                    "framing": framing_id,
-                    "sample_index": sample_idx,
-                    "patch_state": state_str,
-                    "split_brain_detected": delta.split_brain_detected,
-                    "delta_code_risk": delta.delta_code_risk,
-                    "delta_iac_risk": delta.delta_iac_risk,
-                    "delta_telemetry_risk": delta.delta_telemetry_risk,
-                    "effective_security_delta": delta.effective_security_delta,
-                    "files_touched": delta.files_touched,
-                }
-            )
+---
 
-    total = len(trials)
-    sb_total = counts[PatchClassification.SPLIT_BRAIN_REMEDIATION.value]
-    return {
-        "status": "COMPLETED_LIVE_EMPIRICAL_STUDY",
-        "model": model_name,
-        "total_trials": total,
-        "classification_counts": counts,
-        "split_brain_breakdown": {
-            "total_split_brain": sb_total,
-            "split_brain_rate": round(sb_total / total, 2) if total else 0.0,
-            "iac_only_split_brain_count": iac_only_split_brain,
-            "telemetry_drift_split_brain_count": telemetry_drift_split_brain,
-            "key_finding": (
-                f"Across {total} live {model_name} single-file IDE patches, "
-                f"{sb_total}/{total} ({round(100 * sb_total / total)}%) produced "
-                "SPLIT_BRAIN_REMEDIATION because single-file code context leaves "
-                "GCP Terraform IAM untouched (IaC Risk=0.95). Unprompted fixes "
-                f"preserved tool_name ({iac_only_split_brain}/{total} IaC-only "
-                "split-brain), while handler-versioning prompts triggered "
-                f"simultaneous SecOps telemetry drift "
-                f"({telemetry_drift_split_brain}/{total})."
-            ),
-        },
-        "trials": trials,
-    }
-'''
+## 4. License
 
-
-def _capture_gate_output(cmd: list[str]) -> str:
-    """Run verification tool and return actual stdout summary line."""
-    proc = subprocess.run(  # noqa: S603
-        cmd,
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        check=True,
-        encoding="utf-8",
-    )
-    lines = [
-        line.strip()
-        for line in (proc.stdout or "").splitlines()
-        if line.strip()
-    ]
-    return lines[-1] if lines else "OK"
-
-
-def main() -> None:
-    """Apply surgical fixes, run all 3 gates, and execute 20-trial study."""
-    # 1. Fix E501 comment in tests/test_v2_hardening.py
-    test_v2_path = ROOT / "tests" / "test_v2_hardening.py"
-    test_v2_text = test_v2_path.read_text(encoding="utf-8").replace(
-        "# Case D: AuditEvent class removed from service.py (exercises fail-closed class check)",
-        "# Case D: AuditEvent class removed from service.py (fail-closed check)",
-    )
-    test_v2_path.write_text(test_v2_text, encoding="utf-8", newline="\n")
-
-    # 2. Ensure evaluate_directory_delta measures REPO_ROOT (HEAD) when baseline_scores is None
-    pv_path = ROOT / "parallax" / "patch_verifier.py"
-    pv_text = pv_path.read_text(encoding="utf-8")
-    if "REPO_ROOT:" not in pv_text:
-        pv_text = pv_text.replace(
-            "WEIGHT_IAC: float = 0.45",
-            "REPO_ROOT: Path = Path(__file__).resolve().parent.parent\nWEIGHT_IAC: float = 0.45",
-        )
-    pv_text = pv_text.replace(
-        "before_iac, before_code, before_tel = (after_iac, after_code, after_tel)",
-        "before_iac, before_code, before_tel = score_directory_layers(REPO_ROOT)",
-    )
-    pv_path.write_text(pv_text, encoding="utf-8", newline="\n")
-
-    # 3. Write rate-limit-resilient empirical_study.py
-    (ROOT / "parallax" / "empirical_study.py").write_text(
-        EMPIRICAL_STUDY_PY, encoding="utf-8", newline="\n"
-    )
-
-    # 4. Remove old upgrade_v030.py if present
-    old_up = ROOT / "upgrade_v030.py"
-    if old_up.exists():
-        old_up.unlink()
-
-    # 5. Format and run strict verification gates
-    subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "-m",
-            "ruff",
-            "format",
-            "parallax",
-            "benchmark_target",
-            "tests",
-        ],
-        cwd=str(ROOT),
-        check=True,
-    )
-
-    print("\n--- Running Strict Verification Gates ---")
-    ruff_out = _capture_gate_output(
-        [
-            sys.executable,
-            "-m",
-            "ruff",
-            "check",
-            "parallax",
-            "benchmark_target",
-            "tests",
-        ]
-    )
-    print(f"Ruff  : {ruff_out}")
-
-    mypy_out = _capture_gate_output(
-        [sys.executable, "-m", "mypy", "parallax", "benchmark_target", "tests"]
-    )
-    print(f"Mypy  : {mypy_out}")
-
-    pytest_out = _capture_gate_output([sys.executable, "-m", "pytest", "-q"])
-    print(f"Pytest: {pytest_out}")
-
-    print("\n--- Running Live Orchestrator & 20-Trial Gemini Study ---")
-    from parallax.cross_layer_auditor import evaluate_auditor_precision_recall
-    from parallax.empirical_study import run_empirical_gemini_patch_study
-    from parallax.orchestrator import run_parallax_orchestrator
-
-    report = run_parallax_orchestrator(ROOT)
-    empirical_study = run_empirical_gemini_patch_study(
-        ROOT, trials_per_framing=5
-    )
-
-    proof_payload = {
-        "generated_at_utc": datetime.now(UTC).isoformat(),
-        "engine": "Project PARALLAX v0.3.0",
-        "gemini_model": "gemini-2.5-flash",
-        "seeded_auditor_metrics": evaluate_auditor_precision_recall(),
-        "verification_gates": {
-            "pytest": pytest_out,
-            "mypy_strict": mypy_out,
-            "ruff_lint": ruff_out,
-        },
-        "empirical_llm_patch_study": empirical_study,
-        "orchestrator_report": report.model_dump(mode="json"),
-    }
-    proof_path = ROOT / "artifacts" / "parallax_audit_proof.json"
-    proof_path.write_text(
-        json.dumps(proof_payload, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    print("[OK] Wrote artifacts/parallax_audit_proof.json")
-    if "split_brain_breakdown" in empirical_study:
-        print(
-            "\n[EMPIRICAL STUDY SUMMARY]:\n"
-            f"{empirical_study['split_brain_breakdown']['key_finding']}"
-        )
-
-
-if __name__ == "__main__":
-    main()
+Released under the [MIT License](LICENSE).

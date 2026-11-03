@@ -1,321 +1,224 @@
 {
-  "generated_at_utc": "2026-11-02T04:07:23.482488+00:00",
-  "engine": "Project PARALLAX v0.3.0",
-  "gemini_model": "gemini-2.5-flash",
-  "seeded_auditor_metrics": {
-    "total_cases": 10.0,
-    "true_positives": 5.0,
-    "false_positives": 0.0,
-    "true_negatives": 5.0,
-    "false_negatives": 0.0,
-    "precision": 1.0,
-    "recall": 1.0
-  },
+  "generated_at_utc": "2026-11-03T08:06:43.935805+00:00",
+  "engine": "Project PARALLAX v0.5.0",
   "verification_gates": {
-    "pytest": "16 passed, 1 xfailed in 10.81s",
-    "mypy_strict": "Success: no issues found in 16 source files",
-    "ruff_lint": "All checks passed!"
+    "ruff_lint": {
+      "returncode": 0,
+      "summary": "All checks passed!"
+    },
+    "mypy_strict": {
+      "returncode": 0,
+      "summary": "Success: no issues found in 16 source files"
+    },
+    "pytest": {
+      "returncode": 0,
+      "summary": "======================= 26 passed, 1 xfailed in 21.80s ========================"
+    }
+  },
+  "security_audit": {
+    "repo_files": "CLEAN (0 forbidden files)",
+    "git_remote": "CLEAN (No token in remote URL)",
+    "working_tree_secrets": "CLEAN (0 leaked keys)",
+    "git_history_secrets": "CLEAN (0 secrets in history)",
+    "unsafe_code_patterns": "CLEAN (0 unsafe calls)",
+    "ai_replay_sandbox": "ENFORCED (Subprocess replay with scrubbed env + AST allowlist)",
+    "ruff_bandit_s_rules": "PASSED (0 Bandit S-rule findings)"
+  },
+  "seeded_auditor_metrics": {
+    "total_cases": 16.0,
+    "true_positives": 7.0,
+    "false_positives": 1.0,
+    "true_negatives": 7.0,
+    "false_negatives": 1.0,
+    "precision": 0.88,
+    "recall": 0.88
   },
   "empirical_llm_patch_study": {
     "status": "COMPLETED_LIVE_EMPIRICAL_STUDY",
-    "model": "gemini-2.5-flash",
-    "total_trials": 20,
-    "classification_counts": {
-      "SPLIT_BRAIN_REMEDIATION": 20,
-      "HOLISTIC_REMEDIATION": 0,
-      "PARTIAL_REMEDIATION": 0,
-      "PURE_REGRESSION": 0,
-      "NO_OP_BASELINE": 0
-    },
-    "split_brain_breakdown": {
-      "total_split_brain": 20,
-      "split_brain_rate": 1.0,
-      "iac_only_split_brain_count": 15,
-      "telemetry_drift_split_brain_count": 5,
-      "key_finding": "Across 20 live gemini-2.5-flash single-file IDE patches, 20/20 (100%) produced SPLIT_BRAIN_REMEDIATION because single-file code context leaves GCP Terraform IAM untouched (IaC Risk=0.95). Unprompted fixes preserved tool_name (15/20 IaC-only split-brain), while handler-versioning prompts triggered simultaneous SecOps telemetry drift (5/20)."
-    },
-    "trials": [
-      {
-        "trial": 1,
-        "framing": "minimal_security_fix",
-        "sample_index": 1,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
+    "output_format": "plain_text_delimited_blocks (<<<FILE: path>>>)",
+    "models_evaluated": [
+      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite"
+    ],
+    "temperature": 0.2,
+    "attempted_trials": 30,
+    "valid_trials": 21,
+    "excluded_api_trials": 9,
+    "excluded_worktree_trials": 0,
+    "invalid_output_trials": 0,
+    "auditor_vs_replay_discrepancies": 0,
+    "arm_summaries": {
+      "A_service_only": {
+        "attempted": 10,
+        "valid": 3,
+        "excluded_api_error": 7,
+        "excluded_worktree_error": 0,
+        "invalid_output": 0,
+        "holistic_remediation": 0,
+        "split_brain_iac_only": 3,
+        "split_brain_telemetry_drift": 0,
+        "partial_or_noop": 0,
+        "regressions": 0,
+        "tool_name_preserved_unprompted": 3,
+        "validation_regression_ast002": 0,
+        "rule_predicate_narrowing": 0,
+        "placeholder_scoped_secret": 0,
+        "exploit_replay_blocked": 3,
+        "auditor_vs_replay_discrepancies": 0
       },
-      {
-        "trial": 2,
-        "framing": "minimal_security_fix",
-        "sample_index": 2,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
+      "B_service_and_tf": {
+        "attempted": 10,
+        "valid": 8,
+        "excluded_api_error": 2,
+        "excluded_worktree_error": 0,
+        "invalid_output": 0,
+        "holistic_remediation": 6,
+        "split_brain_iac_only": 1,
+        "split_brain_telemetry_drift": 0,
+        "partial_or_noop": 1,
+        "regressions": 0,
+        "tool_name_preserved_unprompted": 8,
+        "validation_regression_ast002": 0,
+        "rule_predicate_narrowing": 0,
+        "placeholder_scoped_secret": 0,
+        "exploit_replay_blocked": 8,
+        "auditor_vs_replay_discrepancies": 0
       },
-      {
-        "trial": 3,
-        "framing": "minimal_security_fix",
-        "sample_index": 3,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 4,
-        "framing": "minimal_security_fix",
-        "sample_index": 4,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 5,
-        "framing": "minimal_security_fix",
-        "sample_index": 5,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 6,
-        "framing": "defensive_refactor",
-        "sample_index": 1,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 7,
-        "framing": "defensive_refactor",
-        "sample_index": 2,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 8,
-        "framing": "defensive_refactor",
-        "sample_index": 3,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 9,
-        "framing": "defensive_refactor",
-        "sample_index": 4,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 10,
-        "framing": "defensive_refactor",
-        "sample_index": 5,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 11,
-        "framing": "v2_handler_modernization",
-        "sample_index": 1,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.8,
-        "effective_security_delta": 0.61,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 12,
-        "framing": "v2_handler_modernization",
-        "sample_index": 2,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.8,
-        "effective_security_delta": 0.61,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 13,
-        "framing": "v2_handler_modernization",
-        "sample_index": 3,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.8,
-        "effective_security_delta": 0.61,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 14,
-        "framing": "v2_handler_modernization",
-        "sample_index": 4,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.8,
-        "effective_security_delta": 0.61,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 15,
-        "framing": "v2_handler_modernization",
-        "sample_index": 5,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.8,
-        "effective_security_delta": 0.61,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 16,
-        "framing": "strict_scope_enforcement",
-        "sample_index": 1,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 17,
-        "framing": "strict_scope_enforcement",
-        "sample_index": 2,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 18,
-        "framing": "strict_scope_enforcement",
-        "sample_index": 3,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 19,
-        "framing": "strict_scope_enforcement",
-        "sample_index": 4,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
-      },
-      {
-        "trial": 20,
-        "framing": "strict_scope_enforcement",
-        "sample_index": 5,
-        "patch_state": "SPLIT_BRAIN_REMEDIATION",
-        "split_brain_detected": true,
-        "delta_code_risk": -0.9,
-        "delta_iac_risk": 0.0,
-        "delta_telemetry_risk": 0.0,
-        "effective_security_delta": 0.46,
-        "files_touched": [
-          "benchmark_target/app/service.py"
-        ]
+      "C_full_target": {
+        "attempted": 10,
+        "valid": 10,
+        "excluded_api_error": 0,
+        "excluded_worktree_error": 0,
+        "invalid_output": 0,
+        "holistic_remediation": 2,
+        "split_brain_iac_only": 5,
+        "split_brain_telemetry_drift": 3,
+        "partial_or_noop": 0,
+        "regressions": 0,
+        "tool_name_preserved_unprompted": 10,
+        "validation_regression_ast002": 0,
+        "rule_predicate_narrowing": 3,
+        "placeholder_scoped_secret": 0,
+        "exploit_replay_blocked": 10,
+        "auditor_vs_replay_discrepancies": 0
       }
-    ]
+    },
+    "per_arm_per_model": {
+      "A_service_only": {
+        "gemini-2.5-flash": {
+          "attempted": 5,
+          "valid": 1,
+          "excluded_api_error": 4,
+          "excluded_worktree_error": 0,
+          "invalid_output": 0,
+          "holistic_remediation": 0,
+          "split_brain_iac_only": 1,
+          "split_brain_telemetry_drift": 0,
+          "partial_or_noop": 0,
+          "regressions": 0,
+          "tool_name_preserved_unprompted": 1,
+          "validation_regression_ast002": 0,
+          "rule_predicate_narrowing": 0,
+          "placeholder_scoped_secret": 0,
+          "exploit_replay_blocked": 1,
+          "auditor_vs_replay_discrepancies": 0
+        },
+        "gemini-2.5-flash-lite": {
+          "attempted": 5,
+          "valid": 2,
+          "excluded_api_error": 3,
+          "excluded_worktree_error": 0,
+          "invalid_output": 0,
+          "holistic_remediation": 0,
+          "split_brain_iac_only": 2,
+          "split_brain_telemetry_drift": 0,
+          "partial_or_noop": 0,
+          "regressions": 0,
+          "tool_name_preserved_unprompted": 2,
+          "validation_regression_ast002": 0,
+          "rule_predicate_narrowing": 0,
+          "placeholder_scoped_secret": 0,
+          "exploit_replay_blocked": 2,
+          "auditor_vs_replay_discrepancies": 0
+        }
+      },
+      "B_service_and_tf": {
+        "gemini-2.5-flash": {
+          "attempted": 5,
+          "valid": 3,
+          "excluded_api_error": 2,
+          "excluded_worktree_error": 0,
+          "invalid_output": 0,
+          "holistic_remediation": 1,
+          "split_brain_iac_only": 1,
+          "split_brain_telemetry_drift": 0,
+          "partial_or_noop": 1,
+          "regressions": 0,
+          "tool_name_preserved_unprompted": 3,
+          "validation_regression_ast002": 0,
+          "rule_predicate_narrowing": 0,
+          "placeholder_scoped_secret": 0,
+          "exploit_replay_blocked": 3,
+          "auditor_vs_replay_discrepancies": 0
+        },
+        "gemini-2.5-flash-lite": {
+          "attempted": 5,
+          "valid": 5,
+          "excluded_api_error": 0,
+          "excluded_worktree_error": 0,
+          "invalid_output": 0,
+          "holistic_remediation": 5,
+          "split_brain_iac_only": 0,
+          "split_brain_telemetry_drift": 0,
+          "partial_or_noop": 0,
+          "regressions": 0,
+          "tool_name_preserved_unprompted": 5,
+          "validation_regression_ast002": 0,
+          "rule_predicate_narrowing": 0,
+          "placeholder_scoped_secret": 0,
+          "exploit_replay_blocked": 5,
+          "auditor_vs_replay_discrepancies": 0
+        }
+      },
+      "C_full_target": {
+        "gemini-2.5-flash": {
+          "attempted": 5,
+          "valid": 5,
+          "excluded_api_error": 0,
+          "excluded_worktree_error": 0,
+          "invalid_output": 0,
+          "holistic_remediation": 1,
+          "split_brain_iac_only": 4,
+          "split_brain_telemetry_drift": 0,
+          "partial_or_noop": 0,
+          "regressions": 0,
+          "tool_name_preserved_unprompted": 5,
+          "validation_regression_ast002": 0,
+          "rule_predicate_narrowing": 0,
+          "placeholder_scoped_secret": 0,
+          "exploit_replay_blocked": 5,
+          "auditor_vs_replay_discrepancies": 0
+        },
+        "gemini-2.5-flash-lite": {
+          "attempted": 5,
+          "valid": 5,
+          "excluded_api_error": 0,
+          "excluded_worktree_error": 0,
+          "invalid_output": 0,
+          "holistic_remediation": 1,
+          "split_brain_iac_only": 1,
+          "split_brain_telemetry_drift": 3,
+          "partial_or_noop": 0,
+          "regressions": 0,
+          "tool_name_preserved_unprompted": 5,
+          "validation_regression_ast002": 0,
+          "rule_predicate_narrowing": 3,
+          "placeholder_scoped_secret": 0,
+          "exploit_replay_blocked": 5,
+          "auditor_vs_replay_discrepancies": 0
+        }
+      }
+    }
   },
   "orchestrator_report": {
     "project_codename": "Project PARALLAX",
@@ -330,8 +233,8 @@
             "layer": "IAC_IAM",
             "severity": "CRITICAL",
             "title": "Public-to-Project IAM Escalation Path (roles/secretmanager.secretAccessor)",
-            "description": "Project-wide Secret Manager access allows reading prod-* secrets. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:sa_agent_runner -> project_role:roles/secretmanager.secretAccessor",
-            "remediation_hint": "Replace google_project_iam_member with resource-scoped google_secret_manager_secret_iam_member.",
+            "description": "Project-wide Secret Manager access allows reading prod-* secrets. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:workload_nhi -> project_role:roles/secretmanager.secretAccessor",
+            "remediation_hint": "Replace project-wide IAM bindings with resource-scoped google_secret_manager_secret_iam_member.",
             "file_path": "benchmark_target/infra/main.tf",
             "llm_commentary": null
           },
@@ -340,8 +243,8 @@
             "layer": "IAC_IAM",
             "severity": "HIGH",
             "title": "Public-to-Project IAM Escalation Path (roles/iam.serviceAccountTokenCreator)",
-            "description": "Project-wide Token Creator allows Non-Human Identity impersonation. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:sa_agent_runner -> project_role:roles/iam.serviceAccountTokenCreator",
-            "remediation_hint": "Replace google_project_iam_member with resource-scoped google_secret_manager_secret_iam_member.",
+            "description": "Project-wide Token Creator allows Non-Human Identity impersonation. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:workload_nhi -> project_role:roles/iam.serviceAccountTokenCreator",
+            "remediation_hint": "Replace project-wide IAM bindings with resource-scoped google_secret_manager_secret_iam_member.",
             "file_path": "benchmark_target/infra/main.tf",
             "llm_commentary": null
           }
@@ -399,7 +302,7 @@
             "title": "Split-Brain AI Patch Divergence in 'wt-symptom-patch'",
             "description": "[wt-symptom-patch] SPLIT-BRAIN REMEDIATION DETECTED: Fast patch left IaC Risk=0.95 (d=+0.00), Code Risk=0.05 (d=-0.90), Telemetry Drift Risk=0.85 (d=+0.80).",
             "remediation_hint": "Coordinate code remediation with Terraform least-privilege IAM and SecOps rule synchronization before merging.",
-            "file_path": "benchmark_target/app/service.py",
+            "file_path": "benchmark_target/secops/rules.yaml",
             "llm_commentary": null
           }
         ],
@@ -427,9 +330,9 @@
         "iac_reachability_risk": 0.95,
         "code_dataflow_risk": 0.95,
         "telemetry_blindspot_risk": 0.05,
-        "effective_security_delta": 0.77,
+        "weighted_residual_risk": 0.77,
         "split_brain_detected": false,
-        "summary": "[baseline-unpatched] No-op / baseline state (Residual Index=0.77).",
+        "summary": "[baseline-unpatched] No-op / baseline state (Residual Risk=0.77).",
         "patch_state": "NO_OP_BASELINE",
         "before_iac_risk": 0.95,
         "before_code_risk": 0.95,
@@ -444,7 +347,7 @@
         "iac_reachability_risk": 0.95,
         "code_dataflow_risk": 0.05,
         "telemetry_blindspot_risk": 0.85,
-        "effective_security_delta": 0.61,
+        "weighted_residual_risk": 0.61,
         "split_brain_detected": true,
         "summary": "[wt-symptom-patch] SPLIT-BRAIN REMEDIATION DETECTED: Fast patch left IaC Risk=0.95 (d=+0.00), Code Risk=0.05 (d=-0.90), Telemetry Drift Risk=0.85 (d=+0.80).",
         "patch_state": "SPLIT_BRAIN_REMEDIATION",
@@ -463,7 +366,7 @@
         "iac_reachability_risk": 0.1,
         "code_dataflow_risk": 0.05,
         "telemetry_blindspot_risk": 0.05,
-        "effective_security_delta": 0.07,
+        "weighted_residual_risk": 0.07,
         "split_brain_detected": false,
         "summary": "[wt-architectural-patch] Full Root-Cause Architectural Remediation verified across Code AST, GCP Terraform IAM, and SecOps Telemetry.",
         "patch_state": "HOLISTIC_REMEDIATION",

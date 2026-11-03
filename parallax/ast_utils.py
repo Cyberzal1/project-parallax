@@ -9,10 +9,15 @@ class AgentToolASTVisitor(ast.NodeVisitor):
 
     def __init__(self) -> None:
         self.has_audit_event_class: bool = False
+        self.has_execute_agent_tool: bool = False
         self.validates_primary_prefix: bool = False
         self.reads_fallback_param: bool = False
         self.overrides_effective_secret: bool = False
         self.revalidates_fallback_prefix: bool = False
+        self.safe_id_pattern_regex: str | None = None
+        self.uses_fullmatch_for_id: bool = False
+        self.regex_anchor_weakened: bool = False
+        self.primary_validation_skipped_on_fallback: bool = False
         self.audited_tool_names: list[str] = []
         self.emitted_event_types: set[str] = set()
         self.emitted_event_samples: list[dict[str, Any]] = []
@@ -21,7 +26,7 @@ class AgentToolASTVisitor(ast.NodeVisitor):
         self.helper_prefix_validators: set[str] = set()
 
     def visit_Module(self, node: ast.Module) -> None:
-        """Pre-scan helper functions that enforce ALLOWED_WORKSPACE_PREFIX."""
+        """Pre-scan helper functions and SAFE_ID_PATTERN regex anchors."""
         for item in node.body:
             if isinstance(item, ast.FunctionDef) and item.name != (
                 "execute_agent_tool"
@@ -29,6 +34,20 @@ class AgentToolASTVisitor(ast.NodeVisitor):
                 fn_src = ast.unparse(item)
                 if "startswith(ALLOWED_WORKSPACE_PREFIX)" in fn_src:
                     self.helper_prefix_validators.add(item.name)
+            elif isinstance(item, ast.Assign):
+                for target in item.targets:
+                    if (
+                        isinstance(target, ast.Name)
+                        and target.id == "SAFE_ID_PATTERN"
+                        and isinstance(item.value, ast.Call)
+                        and item.value.args
+                        and isinstance(item.value.args[0], ast.Constant)
+                        and isinstance(item.value.args[0].value, str)
+                    ):
+                        pat = item.value.args[0].value
+                        self.safe_id_pattern_regex = pat
+                        if not (pat.startswith("^") and pat.endswith("$")):
+                            self.regex_anchor_weakened = True
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -45,8 +64,17 @@ class AgentToolASTVisitor(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Inspect execute_agent_tool for primary vs. fallback validation."""
         if node.name == "execute_agent_tool":
+            self.has_execute_agent_tool = True
             source_segment = ast.unparse(node)
-            if "primary_id.startswith(ALLOWED_WORKSPACE_PREFIX)" in source_segment:
+            if "SAFE_ID_PATTERN.fullmatch" in source_segment:
+                self.uses_fullmatch_for_id = True
+                self.regex_anchor_weakened = False
+
+            if (
+                "primary_id.startswith(ALLOWED_WORKSPACE_PREFIX)" in source_segment
+                or "effective_secret_id.startswith(ALLOWED_WORKSPACE_PREFIX)"
+                in source_segment
+            ):
                 self.validates_primary_prefix = True
             if (
                 '"fallback_secret_id"' in source_segment
@@ -54,19 +82,18 @@ class AgentToolASTVisitor(ast.NodeVisitor):
             ):
                 self.reads_fallback_param = True
 
-            # Detect assignment of fallback_id (or alias) to effective_secret_id
             if (
                 "effective_secret_id = fallback_id" in source_segment
                 or "effective_secret_id = fb_id" in source_segment
             ):
                 self.overrides_effective_secret = True
 
-            # Detect direct prefix check, allowlist check, or helper validator
             if (
                 "fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX)" in source_segment
                 or "fb_id.startswith(ALLOWED_WORKSPACE_PREFIX)" in source_segment
                 or "effective_secret_id.startswith(ALLOWED_WORKSPACE_PREFIX)"
                 in source_segment
+                or "fallback_id in ALLOWED_WORKSPACE_SECRETS" in source_segment
             ):
                 self.revalidates_fallback_prefix = True
             for helper_name in self.helper_prefix_validators:
@@ -75,6 +102,23 @@ class AgentToolASTVisitor(ast.NodeVisitor):
                     or f"{helper_name}(effective_secret_id)" in source_segment
                 ):
                     self.revalidates_fallback_prefix = True
+
+            # Check if primary_id validation was moved into an orelse (elif/else)
+            # of a use_fallback / fallback_id conditional
+            for child in ast.walk(node):
+                if isinstance(child, ast.If):
+                    test_src = ast.unparse(child.test)
+                    if (
+                        "use_fallback" in test_src or "fallback_id" in test_src
+                    ) and child.orelse:
+                        orelse_src = "\n".join(
+                            ast.unparse(stmt) for stmt in child.orelse
+                        )
+                        if "primary_id" in orelse_src and (
+                            "SAFE_ID_PATTERN" in orelse_src
+                            or "ALLOWED_WORKSPACE_PREFIX" in orelse_src
+                        ):
+                            self.primary_validation_skipped_on_fallback = True
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:

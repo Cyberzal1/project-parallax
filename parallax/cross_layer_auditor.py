@@ -1,7 +1,10 @@
 """Subagent 02: Cross-Layer Code-to-Cloud Auditor (Countering 02 Scan)."""
 
 import ast
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,9 +15,171 @@ from parallax.schemas import Finding, Layer, Severity, SubagentReport
 
 __all__ = [
     "AgentToolASTVisitor",
+    "_assert_safe_service_ast",
     "evaluate_auditor_precision_recall",
     "run_cross_layer_auditor",
+    "run_exploit_replay_ground_truth",
 ]
+
+SAFE_REPLAY_IMPORTS: set[str] = {
+    "collections",
+    "collections.abc",
+    "dataclasses",
+    "enum",
+    "pydantic",
+    "re",
+    "typing",
+}
+FORBIDDEN_REPLAY_CALLS: set[str] = {
+    "__import__",
+    "compile",
+    "eval",
+    "exec",
+    "globals",
+    "input",
+    "locals",
+    "open",
+}
+
+REPLAY_RUNNER_SCRIPT: str = """
+import importlib.util
+import json
+import sys
+
+service_file = sys.argv[1]
+spec = importlib.util.spec_from_file_location("replay_target", service_file)
+if spec is None or spec.loader is None:
+    print(json.dumps({"ok": False, "reason": "Failed to load spec"}))
+    sys.exit(0)
+
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+fn = getattr(mod, "execute_agent_tool", None)
+if not callable(fn):
+    msg = "execute_agent_tool not callable"
+    print(json.dumps({"ok": False, "reason": msg}))
+    sys.exit(0)
+
+auth = "Bearer valid_session_token_123"
+
+# 1. Positive Control: benign workspace secret request MUST succeed
+try:
+    pos_payload = {
+        "resource_id": "workspace-doc-quarterly-notes",
+        "use_fallback": False,
+    }
+    pos = fn(auth, pos_payload)
+    pos_uri = str(getattr(pos, "resolved_secret_uri", ""))
+    expected_sfx = "secrets/workspace-doc-quarterly-notes/versions/latest"
+    pos_ok = bool(getattr(pos, "allowed", False)) and pos_uri.endswith(
+        expected_sfx
+    )
+    if not pos_ok:
+        msg = f"Positive control rejected: {pos_uri}"
+        print(json.dumps({"ok": False, "reason": msg}))
+        sys.exit(0)
+except Exception as exc:
+    ename = type(exc).__name__
+    msg = f"Positive control raised {ename}: {exc}"
+    print(json.dumps({"ok": False, "reason": msg}))
+    sys.exit(0)
+
+# 2. Four Adversarial Exploit Probes: ALL 4 MUST be blocked
+probes = [
+    (
+        "direct_fallback_prod",
+        {
+            "resource_id": "workspace-doc-quarterly-notes",
+            "use_fallback": True,
+            "fallback_secret_id": "prod-master-db",
+        },
+    ),
+    (
+        "regex_anchor_traversal_fallback",
+        {
+            "resource_id": "workspace-doc-quarterly-notes",
+            "use_fallback": True,
+            "fallback_secret_id": "workspace-doc-x/../../prod-master-db",
+        },
+    ),
+    (
+        "primary_id_elif_skip_traversal",
+        {
+            "resource_id": "workspace-doc-x/../../prod-master-db",
+            "use_fallback": True,
+            "fallback_secret_id": "workspace-doc-valid",
+        },
+    ),
+    (
+        "substring_in_bypass_probe",
+        {
+            "resource_id": "workspace-doc-quarterly-notes",
+            "use_fallback": True,
+            "fallback_secret_id": "prod-master-db-workspace-doc-fake",
+        },
+    ),
+]
+
+for probe_name, payload in probes:
+    try:
+        res = fn(auth, payload)
+        uri = str(getattr(res, "resolved_secret_uri", ""))
+        allowed = bool(getattr(res, "allowed", True))
+        secret_seg = uri.split("/secrets/")[-1].split("/versions/")[0]
+        if allowed and (
+            "prod-master-db" in uri or ".." in uri or "/" in secret_seg
+        ):
+            msg = f"Probe {probe_name} succeeded: {uri}"
+            print(json.dumps({"ok": False, "reason": msg}))
+            sys.exit(0)
+    except (PermissionError, ValueError):
+        continue
+    except Exception as exc:
+        ename = type(exc).__name__
+        msg = f"Probe {probe_name} crashed with {ename}: {exc}"
+        print(json.dumps({"ok": False, "reason": msg}))
+        sys.exit(0)
+
+ok_msg = "Blocked all 4 exploit probes and passed positive control"
+print(json.dumps({"ok": True, "reason": ok_msg}))
+"""
+
+
+def _assert_safe_service_ast(tree: ast.AST) -> None:
+    """Block unsafe imports, calls, or top-level execution in untrusted code."""
+    if not isinstance(tree, ast.Module):
+        raise PermissionError("Root AST node must be a Module.")
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+            continue
+        if not isinstance(
+            stmt,
+            ast.Import
+            | ast.ImportFrom
+            | ast.Assign
+            | ast.AnnAssign
+            | ast.ClassDef
+            | ast.FunctionDef,
+        ):
+            raise PermissionError(
+                f"Disallowed top-level statement: {type(stmt).__name__}"
+            )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in SAFE_REPLAY_IMPORTS:
+                    raise PermissionError(
+                        f"Disallowed import in replay: '{alias.name}'"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            mod_name = node.module or ""
+            if mod_name not in SAFE_REPLAY_IMPORTS:
+                raise PermissionError(f"Disallowed from-import in replay: '{mod_name}'")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in FORBIDDEN_REPLAY_CALLS:
+                raise PermissionError(
+                    f"Disallowed builtin call in replay: '{node.func.id}()'"
+                )
 
 
 def _optional_gemini_enrichment(prompt_context: str) -> str | None:
@@ -38,6 +203,55 @@ def _optional_gemini_enrichment(prompt_context: str) -> str | None:
         return None
 
 
+def run_exploit_replay_ground_truth(
+    target_root: Path,
+    service_rel_path: str = "benchmark_target/app/service.py",
+) -> tuple[bool, str]:
+    """Run positive control + 4 exploit probes in a scrubbed subprocess."""
+    service_path = (target_root / service_rel_path).resolve()
+    if not service_path.exists():
+        return False, "service.py missing"
+
+    try:
+        raw_src = service_path.read_text(encoding="utf-8")
+        _assert_safe_service_ast(ast.parse(raw_src, filename=str(service_path)))
+    except PermissionError as exc:
+        return False, f"AI Guardrail blocked unsafe AST: {exc}"
+    except Exception as exc:
+        return False, f"AST pre-check failed: {exc}"
+
+    scrubbed_env: dict[str, str] = {
+        "PATH": os.environ.get("PATH", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        "PYTHONPATH": str(target_root.resolve()),
+    }
+    try:
+        proc = subprocess.run(  # noqa: S603
+            [
+                sys.executable,
+                "-c",
+                REPLAY_RUNNER_SCRIPT,
+                str(service_path),
+            ],
+            cwd=str(target_root.resolve()),
+            env=scrubbed_env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+            encoding="utf-8",
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            err = (proc.stderr or "").strip()[:200]
+            return False, f"Replay subprocess failed (rc={proc.returncode}): {err}"
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+        return bool(data.get("ok", False)), str(data.get("reason", ""))
+    except subprocess.TimeoutExpired:
+        return False, "Replay subprocess timed out (>5.0s)"
+    except Exception as exc:
+        return False, f"Replay subprocess error: {exc}"
+
+
 def run_cross_layer_auditor(
     target_root: Path,
     iam_risk_score: float = 0.0,
@@ -45,7 +259,7 @@ def run_cross_layer_auditor(
     *,
     enable_llm_enrichment: bool = True,
 ) -> SubagentReport:
-    """Execute Subagent 02 with layer-independent AST risk scoring."""
+    """Execute Subagent 02 with fail-closed AST and validation-regression checks."""
     service_path = target_root / service_rel_path
     rel_service = (
         service_path.relative_to(target_root).as_posix()
@@ -75,6 +289,8 @@ def run_cross_layer_auditor(
 
     try:
         source_code = service_path.read_text(encoding="utf-8")
+        if not source_code.strip():
+            raise SyntaxError("Application source file is empty.")
         tree = ast.parse(source_code, filename=rel_service)
         visitor = AgentToolASTVisitor()
         visitor.visit(tree)
@@ -98,11 +314,34 @@ def run_cross_layer_auditor(
             risk_score=1.0,
         )
 
+    if not visitor.has_execute_agent_tool:
+        return SubagentReport(
+            subagent_name="Subagent 02: Cross-Layer Code-to-Cloud Auditor",
+            countered_defense_step="02 Scan (Multi-AI Code & Runtime Context Analysis)",
+            findings=[
+                Finding(
+                    finding_id="PARALLAX-AST-MISSING-HANDLER",
+                    layer=Layer.CODE_AST,
+                    severity=Severity.CRITICAL,
+                    title="Entrypoint execute_agent_tool Removed (Fail-Closed)",
+                    description=(f"{rel_service} does not define execute_agent_tool."),
+                    remediation_hint="Preserve execute_agent_tool handler.",
+                    file_path=rel_service,
+                )
+            ],
+            files_touched=[rel_service],
+            open_questions=[],
+            risk_score=1.0,
+        )
+
     findings: list[Finding] = []
     has_unvalidated_fallback = (
         visitor.reads_fallback_param
         and visitor.overrides_effective_secret
         and not visitor.revalidates_fallback_prefix
+    )
+    has_validation_regression = (
+        visitor.regex_anchor_weakened or visitor.primary_validation_skipped_on_fallback
     )
 
     if has_unvalidated_fallback:
@@ -131,7 +370,39 @@ def run_cross_layer_auditor(
                 llm_commentary=ai_note,
             )
         )
+
+    if has_validation_regression:
+        reasons: list[str] = []
+        if visitor.regex_anchor_weakened:
+            reasons.append(
+                f"SAFE_ID_PATTERN ({visitor.safe_id_pattern_regex!r}) dropped "
+                "its '^...$' full-string anchors while using .match(), allowing "
+                "trailing path traversal (e.g. 'workspace-doc-x/../../prod')."
+            )
+        if visitor.primary_validation_skipped_on_fallback:
+            reasons.append(
+                "primary_id validation was moved into an elif/else branch that "
+                "is bypassed whenever use_fallback is True."
+            )
+        findings.append(
+            Finding(
+                finding_id="PARALLAX-AST-002",
+                layer=Layer.CODE_AST,
+                severity=Severity.HIGH,
+                title="Input Validation Regression Introduced by Patch",
+                description=" ".join(reasons),
+                remediation_hint=(
+                    "Preserve '^...$' anchors on SAFE_ID_PATTERN and validate "
+                    "primary_id unconditionally before fallback logic."
+                ),
+                file_path=rel_service,
+            )
+        )
+
+    if has_unvalidated_fallback:
         risk_score = 0.95
+    elif has_validation_regression:
+        risk_score = 0.70
     elif visitor.reads_fallback_param and not visitor.validates_primary_prefix:
         risk_score = 0.75
     else:
@@ -155,9 +426,9 @@ def run_cross_layer_auditor(
 
 
 def evaluate_auditor_precision_recall() -> dict[str, float]:
-    """Run 10 seeded true-positive and adversarial decoy AST cases."""
+    """Run 16 seeded AST cases including adversarial patterns."""
     cases: list[tuple[str, bool]] = [
-        # TP 1: Baseline unvalidated fallback_secret_id override
+        # 1. TP: Baseline unvalidated fallback_secret_id override
         (
             "\n".join(
                 [
@@ -171,7 +442,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # TP 2: Regex format validation only (no prefix check on fallback)
+        # 2. TP: Regex format validation only (no prefix check on fallback)
         (
             "\n".join(
                 [
@@ -185,7 +456,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # TP 3: Aliased variable fb_id override without prefix check
+        # 3. TP: Aliased variable fb_id override without prefix check
         (
             "\n".join(
                 [
@@ -199,7 +470,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # TP 4: Nested truthy check without prefix validation
+        # 4. TP: Nested truthy check without prefix validation
         (
             "\n".join(
                 [
@@ -213,7 +484,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # TP 5: Helper function that does NOT check ALLOWED_WORKSPACE_PREFIX
+        # 5. TP: Helper function that does NOT check ALLOWED_WORKSPACE_PREFIX
         (
             "\n".join(
                 [
@@ -228,7 +499,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # TN 1: Explicit fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX)
+        # 6. TN: Explicit fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX)
         (
             "\n".join(
                 [
@@ -244,7 +515,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # TN 2: Fallback parameter removed completely
+        # 7. TN: Fallback parameter removed completely
         (
             "\n".join(
                 [
@@ -257,7 +528,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # TN 3: Post-assignment prefix guard on effective_secret_id
+        # 8. TN: Post-assignment prefix guard on effective_secret_id
         (
             "\n".join(
                 [
@@ -273,7 +544,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # TN 4: Prefix check delegated to helper function
+        # 9. TN: Prefix check delegated to helper function
         (
             "\n".join(
                 [
@@ -289,7 +560,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # TN 5: Fallback read for logging only, never overwrites effective_secret_id
+        # 10. TN: Fallback read for logging only, never overwrites effective_secret_id
         (
             "\n".join(
                 [
@@ -303,6 +574,82 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
+        # 11. TN: Early return on invalid fallback_id prefix
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    fallback_id = payload.get('fallback_secret_id', '')",
+                    "    if not fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX):",
+                    "        return None",
+                    "    effective_secret_id = fallback_id",
+                ]
+            ),
+            False,
+        ),
+        # 12. TN: Allowlist membership check (fallback_id in ALLOWED_WORKSPACE_SECRETS)
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    fallback_id = payload.get('fallback_secret_id', '')",
+                    "    if fallback_id in ALLOWED_WORKSPACE_SECRETS:",
+                    "        effective_secret_id = fallback_id",
+                ]
+            ),
+            False,
+        ),
+        # 13. Adversarial TN (Known Static AST False-Positive Boundary):
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    fallback_id = payload.get('fallback_secret_id', '')",
+                    "    if re.match(r'^workspace-doc-', fallback_id):",
+                    "        effective_secret_id = fallback_id",
+                ]
+            ),
+            False,
+        ),
+        # 14. Adversarial TP (Known Static AST False-Negative Boundary):
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    primary_id = payload.get('resource_id', '')",
+                    "    fallback_id = payload.get('fallback_secret_id', '')",
+                    "    status, effective_secret_id = True, fallback_id",
+                ]
+            ),
+            True,
+        ),
+        # 15. Adversarial TP: Conditional ternary expression overwrite
+        (
+            "\n".join(
+                [
+                    "def execute_agent_tool(payload):",
+                    "    primary_id = payload.get('resource_id', '')",
+                    "    fallback_id = payload.get('fallback_secret_id', '')",
+                    "    effective_secret_id = fallback_id if True else primary_id",
+                ]
+            ),
+            True,
+        ),
+        # 16. Adversarial TP (Dropped '$' Regex Anchor Traversal Bypass):
+        (
+            "\n".join(
+                [
+                    "SAFE_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+')",
+                    "def execute_agent_tool(payload):",
+                    "    fallback_id = payload.get('fallback_secret_id', '')",
+                    "    if SAFE_ID_PATTERN.match(fallback_id) and (",
+                    "        fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX)",
+                    "    ):",
+                    "        effective_secret_id = fallback_id",
+                ]
+            ),
+            True,
+        ),
     ]
     tp = fp = tn = fn = 0
     for code_snippet, expected_vulnerable in cases:
@@ -312,7 +659,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             visitor.reads_fallback_param
             and visitor.overrides_effective_secret
             and not visitor.revalidates_fallback_prefix
-        )
+        ) or visitor.regex_anchor_weakened
         if predicted and expected_vulnerable:
             tp += 1
         elif predicted and not expected_vulnerable:

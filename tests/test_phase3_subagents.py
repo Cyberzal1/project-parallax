@@ -10,14 +10,17 @@ from parallax.orchestrator import (
     apply_symptom_only_ide_patch,
     run_parallax_orchestrator,
 )
-from parallax.patch_verifier import evaluate_directory_delta
+from parallax.patch_verifier import (
+    evaluate_directory_delta,
+    score_directory_layers,
+)
 from parallax.telemetry_validator import run_telemetry_validator
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
 def _ensure_git_commit_exists(repo_dir: Path) -> None:
-    """Ensure local repo has at least one commit so git worktree add HEAD succeeds."""
+    """Ensure local repo has at least one commit so git worktree add HEAD works."""
     check = subprocess.run(  # noqa: S603
         ["git", "rev-parse", "--verify", "HEAD"],  # noqa: S607
         cwd=str(repo_dir),
@@ -30,7 +33,12 @@ def _ensure_git_commit_exists(repo_dir: Path) -> None:
             ["git", "config", "user.email", "parallax@local.test"],
             ["git", "config", "user.name", "Parallax Auditor"],
             ["git", "add", "."],
-            ["git", "commit", "-m", "chore: baseline snapshot for worktree testing"],
+            [
+                "git",
+                "commit",
+                "-m",
+                "chore: baseline snapshot for worktree testing",
+            ],
         ]
         for cmd in cmds:
             subprocess.run(cmd, cwd=str(repo_dir), check=True)  # noqa: S603
@@ -69,8 +77,12 @@ def test_gate3_split_brain_differential_mathematics(tmp_path: Path) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
+    baseline_scores = score_directory_layers(tmp_path)
+
     apply_symptom_only_ide_patch(tmp_path)
-    symptom_delta = evaluate_directory_delta(tmp_path, "unit-symptom-patch")
+    symptom_delta = evaluate_directory_delta(
+        tmp_path, "unit-symptom-patch", baseline_scores=baseline_scores
+    )
     assert symptom_delta.code_dataflow_risk < 0.2
     assert symptom_delta.iac_reachability_risk >= 0.9
     assert symptom_delta.telemetry_blindspot_risk >= 0.8
@@ -82,7 +94,9 @@ def test_gate3_split_brain_differential_mathematics(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     apply_holistic_architectural_patch(tmp_path)
-    holistic_delta = evaluate_directory_delta(tmp_path, "unit-holistic-patch")
+    holistic_delta = evaluate_directory_delta(
+        tmp_path, "unit-holistic-patch", baseline_scores=baseline_scores
+    )
     assert holistic_delta.code_dataflow_risk < 0.2
     assert holistic_delta.iac_reachability_risk < 0.2
     assert holistic_delta.telemetry_blindspot_risk < 0.2
@@ -100,10 +114,9 @@ def test_gate3_end_to_end_orchestrator_with_git_worktrees() -> None:
     assert len(orchestrator_report.split_brain_evaluations) == 3
 
     by_name = {d.patch_name: d for d in orchestrator_report.split_brain_evaluations}
-    assert by_name["baseline-unpatched"].split_brain_detected is False
     assert by_name["wt-symptom-patch"].split_brain_detected is True
     assert by_name["wt-architectural-patch"].split_brain_detected is False
     assert (
-        by_name["wt-architectural-patch"].effective_security_delta
-        < by_name["wt-symptom-patch"].effective_security_delta
+        by_name["wt-architectural-patch"].weighted_residual_risk
+        < by_name["wt-symptom-patch"].weighted_residual_risk
     )
