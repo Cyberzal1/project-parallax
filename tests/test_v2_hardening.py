@@ -788,17 +788,19 @@ resource "google_secret_manager_secret_iam_member" "scoped_ok" {
 def test_v7_telemetry_aggregate_coverage_and_secops002_rename_or_delete(
     tmp_path: Path,
 ) -> None:
-    """Prove Round 5 #3: narrowing 001 keeps aggregate coverage; deleting/renaming 002 fails."""
+    """Prove Round 5 #3: aggregate corpus coverage and SECOPS_GCP_002 rename."""
     _copy_baseline_to_tmp(tmp_path)
     rules_path = tmp_path / "benchmark_target" / "secops" / "rules.yaml"
     orig_rules = rules_path.read_text(encoding="utf-8")
 
-    # 1. Narrow SECOPS_GCP_001 to workspace-doc- while SECOPS_GCP_002 still covers prod-
-    narrow_001 = orig_rules.replace(
-        '    match:\n      event_type: "SECRET_MANAGER_ACCESS"\n      tool_name: "read_workspace_context"\n',
-        '    match:\n      event_type: "SECRET_MANAGER_ACCESS"\n      tool_name: "read_workspace_context"\n      target_secret_prefix: "workspace-doc-"\n',
-        1,
+    # 1. Narrow SECOPS_GCP_001 while SECOPS_GCP_002 still covers prod-
+    old_m = (
+        "    match:\n"
+        '      event_type: "SECRET_MANAGER_ACCESS"\n'
+        '      tool_name: "read_workspace_context"\n'
     )
+    new_m = old_m + '      target_secret_prefix: "workspace-doc-"\n'
+    narrow_001 = orig_rules.replace(old_m, new_m, 1)
     rules_path.write_text(narrow_001, encoding="utf-8")
     rep_001 = run_telemetry_validator(tmp_path)
     # Minor redundancy penalty (0.15), NOT a >0.35 blindspot!
@@ -827,7 +829,7 @@ def test_v7_telemetry_aggregate_coverage_and_secops002_rename_or_delete(
 def test_v7_pathlib_rejected_with_screen_rejected_status(
     tmp_path: Path,
 ) -> None:
-    """Prove Round 5 #5: pathlib is blocked and emits screen_rejected, not discrepancy."""
+    """Prove Round 5 #5: pathlib emits screen_rejected, not discrepancy."""
     _copy_baseline_to_tmp(tmp_path)
     svc_path = tmp_path / "benchmark_target" / "app" / "service.py"
     orig_code = svc_path.read_text(encoding="utf-8")

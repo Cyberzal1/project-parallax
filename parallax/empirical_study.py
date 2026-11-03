@@ -5,6 +5,7 @@ import difflib
 import hashlib
 import math
 import re
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -470,7 +471,10 @@ def rescore_saved_trials(
             )
 
     summary_payload: dict[str, Any] = {
-        "status": f"RESCORED_EXISTING_30_OUTPUTS_V070 ({valid_count}/30 VALID, 0 NEW API CALLS)",
+        "status": (
+            f"RESCORED_EXISTING_30_OUTPUTS_V070 "
+            f"({valid_count}/30 VALID, 0 NEW API CALLS)"
+        ),
         "rescore_disclosure": (
             "Re-scored the same 30 v0.5.0 model outputs with zero new API "
             "calls using v0.7.0 IaC positive controls and aggregate telemetry "

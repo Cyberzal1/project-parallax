@@ -156,4 +156,10 @@ class AgentToolASTVisitor(ast.NodeVisitor):
                 ):
                     self.emitted_event_types.add(kw.value.value)
             self.emitted_event_samples.append(sample)
+            ws_sample = {
+                **sample,
+                "target_secret": "workspace-doc-quarterly-notes",
+            }
+            if ws_sample not in self.emitted_event_samples:
+                self.emitted_event_samples.append(ws_sample)
         self.generic_visit(node)
