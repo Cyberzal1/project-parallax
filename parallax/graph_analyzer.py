@@ -21,20 +21,24 @@ PRIVILEGED_ROLES: dict[str, tuple[Severity, str]] = {
     ),
 }
 
-KNOWN_GCP_TERRAFORM_RESOURCES: set[str] = {
+VALID_GCP_IAM_AND_SECRET_RESOURCES: set[str] = {
     "google_service_account",
-    "google_cloud_run_v2_service",
+    "google_service_account_key",
+    "google_service_account_iam_member",
+    "google_service_account_iam_binding",
+    "google_service_account_iam_policy",
     "google_project_iam_member",
     "google_project_iam_binding",
     "google_project_iam_policy",
+    "google_project_iam_custom_role",
     "google_secret_manager_secret",
     "google_secret_manager_secret_version",
     "google_secret_manager_secret_iam_member",
     "google_secret_manager_secret_iam_binding",
     "google_secret_manager_secret_iam_policy",
-    "google_service_account_iam_member",
-    "google_service_account_iam_binding",
-    "google_service_account_iam_policy",
+    "google_cloud_run_v2_service_iam_member",
+    "google_cloud_run_v2_service_iam_binding",
+    "google_cloud_run_v2_service_iam_policy",
 }
 
 PLACEHOLDER_SUBSTRINGS: tuple[str, ...] = (
@@ -47,6 +51,12 @@ PLACEHOLDER_SUBSTRINGS: tuple[str, ...] = (
     "your-",
     "your_",
 )
+
+
+def _is_iam_or_secret_resource_type(res_type: str) -> bool:
+    """Return True if resource type purports to configure IAM or Secrets."""
+    low = res_type.lower()
+    return "iam" in low or "secret" in low or "service_account" in low
 
 
 def _extract_declared_sas(tf_data: dict[str, Any]) -> dict[str, str]:
@@ -82,14 +92,17 @@ def _audit_terraform_resources_and_secrets(
     raw_hcl: str,
     rel_tf: str,
     sa_map: dict[str, str],
-) -> tuple[list[Finding], bool, bool]:
-    """Validate resource types, declared secrets, placeholders, and SA self-grants.
+    active_workload_sas: set[str],
+) -> tuple[list[Finding], bool, bool, bool]:
+    """Validate IAM/secret resource types, scoped bindings, and positive control.
 
-    Returns (findings, has_unknown_resource, has_invalid_scoped_or_self_grant).
+    Returns:
+      (findings, has_unknown_res, has_scoped_issue, has_valid_scoped_replacement)
     """
     findings: list[Finding] = []
     has_unknown_res = False
     has_scoped_issue = False
+    has_valid_scoped_replacement = False
 
     declared_secret_res: set[str] = set()
     declared_secret_ids: set[str] = set()
@@ -100,20 +113,44 @@ def _audit_terraform_resources_and_secrets(
                 if isinstance(sec_body, dict) and sec_body.get("secret_id"):
                     declared_secret_ids.add(str(sec_body["secret_id"]).strip())
 
-    # Check raw HCL lines around secret_id for placeholder comments
+    # Scan raw HCL lines for commented-out placeholder secret blocks
     raw_secret_comment_flagged = False
+    commented_placeholder_detected = False
     for line in raw_hcl.splitlines():
-        low = line.lower()
+        low = line.strip().lower()
         if "secret_id" in low and "#" in low:
             comment_part = low.split("#", 1)[1]
             if any(p in comment_part for p in PLACEHOLDER_SUBSTRINGS):
                 raw_secret_comment_flagged = True
+                if low.startswith("#"):
+                    commented_placeholder_detected = True
+
+    if commented_placeholder_detected:
+        findings.append(
+            Finding(
+                finding_id="PARALLAX-IAM-COMMENTED-OUT-PLACEHOLDER",
+                layer=Layer.IAC_IAM,
+                severity=Severity.MEDIUM,
+                title="Commented-Out Placeholder Secret Block in Terraform",
+                description=(
+                    f"{rel_tf} contains commented-out secret IAM blocks with "
+                    "placeholder instructions (e.g. '# Replace with actual')."
+                ),
+                remediation_hint=(
+                    "Uncomment and bind a declared google_secret_manager_secret."
+                ),
+                file_path=rel_tf,
+            )
+        )
 
     for block in tf_data.get("resource", []):
         if not isinstance(block, dict):
             continue
         for res_type, instances in block.items():
-            if res_type not in KNOWN_GCP_TERRAFORM_RESOURCES:
+            if (
+                _is_iam_or_secret_resource_type(res_type)
+                and res_type not in VALID_GCP_IAM_AND_SECRET_RESOURCES
+            ):
                 has_unknown_res = True
                 findings.append(
                     Finding(
@@ -123,17 +160,15 @@ def _audit_terraform_resources_and_secrets(
                         layer=Layer.IAC_IAM,
                         severity=Severity.CRITICAL,
                         title=(
-                            f"Unrecognized Terraform Resource Type '{res_type}' "
+                            f"Unrecognized IAM/Secret Resource Type '{res_type}' "
                             "(Fail-Closed)"
                         ),
                         description=(
-                            f"{rel_tf} declares resource type '{res_type}', "
-                            "which is not a valid Google Cloud provider IAM or "
-                            "Secret Manager resource."
+                            f"{rel_tf} declares '{res_type}', which is not a "
+                            "valid hashicorp/google IAM or Secret Manager type."
                         ),
                         remediation_hint=(
-                            "Use google_secret_manager_secret_iam_member and "
-                            "validate with terraform validate."
+                            "Use google_secret_manager_secret_iam_member."
                         ),
                         file_path=rel_tf,
                     )
@@ -163,7 +198,6 @@ def _audit_terraform_resources_and_secrets(
             if not isinstance(instances, dict):
                 continue
 
-            # Check SA self-impersonation / token creator on service account
             if res_type in (
                 "google_service_account_iam_member",
                 "google_service_account_iam_binding",
@@ -195,7 +229,6 @@ def _audit_terraform_resources_and_secrets(
                             )
                         )
 
-            # Check scoped secret bindings
             if res_type in (
                 "google_secret_manager_secret_iam_member",
                 "google_secret_manager_secret_iam_binding",
@@ -205,6 +238,10 @@ def _audit_terraform_resources_and_secrets(
                     if not isinstance(bind_body, dict):
                         continue
                     sec_id = str(bind_body.get("secret_id", "")).strip()
+                    role = str(bind_body.get("role", "")).strip()
+                    member_raw = json.dumps(
+                        bind_body.get("member", bind_body.get("members", ""))
+                    )
                     low_sec = sec_id.lower()
                     has_for_each = "for_each" in bind_body
 
@@ -218,7 +255,6 @@ def _audit_terraform_resources_and_secrets(
                     )
                     is_dangling_each = "each." in sec_id and not has_for_each
 
-                    # Must reference a declared google_secret_manager_secret
                     refs_declared_res = any(
                         f"google_secret_manager_secret.{r}" in sec_id
                         for r in declared_secret_res
@@ -262,8 +298,20 @@ def _audit_terraform_resources_and_secrets(
                                 file_path=rel_tf,
                             )
                         )
+                    else:
+                        bound_sa = _resolve_sa_node(member_raw, sa_map)
+                        if (
+                            role == "roles/secretmanager.secretAccessor"
+                            and bound_sa in active_workload_sas
+                        ):
+                            has_valid_scoped_replacement = True
 
-    return findings, has_unknown_res, has_scoped_issue
+    return (
+        findings,
+        has_unknown_res,
+        has_scoped_issue,
+        has_valid_scoped_replacement,
+    )
 
 
 def build_iam_exposure_graph(tf_data: dict[str, Any]) -> nx.DiGraph:
@@ -360,7 +408,7 @@ def run_graph_analyzer(
     target_root: Path,
     tf_rel_path: str = "benchmark_target/infra/main.tf",
 ) -> SubagentReport:
-    """Execute Subagent 01 and fail closed on unknown or invalid Terraform."""
+    """Execute Subagent 01 with IaC positive control and fail-closed checks."""
     tf_path = target_root / tf_rel_path
     rel_tf = (
         tf_path.relative_to(target_root).as_posix()
@@ -458,6 +506,12 @@ def run_graph_analyzer(
             risk_score=1.0,
         )
 
+    active_workload_sas: set[str] = set()
+    for c_node in compute_nodes:
+        for _, target_sa in graph.out_edges(c_node):
+            if str(target_sa).startswith("sa:"):
+                active_workload_sas.add(str(target_sa))
+
     findings: list[Finding] = []
     idx = 1
 
@@ -489,8 +543,13 @@ def run_graph_analyzer(
             )
             idx += 1
 
-    extra_findings, has_unknown_res, has_scoped_issue = (
-        _audit_terraform_resources_and_secrets(tf_data, raw_hcl, rel_tf, sa_map)
+    (
+        extra_findings,
+        has_unknown_res,
+        has_scoped_issue,
+        has_valid_scoped_replacement,
+    ) = _audit_terraform_resources_and_secrets(
+        tf_data, raw_hcl, rel_tf, sa_map, active_workload_sas
     )
     findings.extend(extra_findings)
 
@@ -503,12 +562,34 @@ def run_graph_analyzer(
         risk_score = 0.75
     elif has_scoped_issue:
         risk_score = 0.65
+    elif not has_valid_scoped_replacement:
+        # IaC Positive Control failed: all access revoked with no replacement!
+        findings.append(
+            Finding(
+                finding_id="PARALLAX-IAM-ACCESS-REVOKED-NO-REPLACEMENT",
+                layer=Layer.IAC_IAM,
+                severity=Severity.HIGH,
+                title=("All Secret Manager Access Revoked Without Scoped Replacement"),
+                description=(
+                    f"{rel_tf} removed project-wide IAM roles but added zero "
+                    "valid resource-scoped secretAccessor bindings for the "
+                    "Cloud Run workload service account. Legitimate workspace "
+                    "secret reads will fail at runtime."
+                ),
+                remediation_hint=(
+                    "Bind google_secret_manager_secret_iam_member with "
+                    "roles/secretmanager.secretAccessor to a declared secret."
+                ),
+                file_path=rel_tf,
+            )
+        )
+        risk_score = 0.60
     else:
         risk_score = 0.10
 
     open_q = (
         ["Can app tool parameters steer this NHI into reading prod-* secrets?"]
-        if findings
+        if project_role_count > 0
         else []
     )
 

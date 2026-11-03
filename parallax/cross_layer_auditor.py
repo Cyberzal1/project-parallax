@@ -20,9 +20,11 @@ __all__ = [
     "_assert_safe_service_ast",
     "evaluate_auditor_precision_recall",
     "run_cross_layer_auditor",
+    "run_exploit_replay_detailed",
     "run_exploit_replay_ground_truth",
 ]
 
+# Tightened allowlist: pathlib and logging removed to prevent file read/write
 SAFE_REPLAY_IMPORTS: set[str] = {
     "collections",
     "collections.abc",
@@ -35,9 +37,7 @@ SAFE_REPLAY_IMPORTS: set[str] = {
     "hmac",
     "itertools",
     "json",
-    "logging",
     "math",
-    "pathlib",
     "pydantic",
     "re",
     "typing",
@@ -79,15 +79,20 @@ import sys
 service_file = sys.argv[1]
 spec = importlib.util.spec_from_file_location("replay_target", service_file)
 if spec is None or spec.loader is None:
-    print(json.dumps({"ok": False, "reason": "Failed to load spec"}))
+    out = {"ok": False, "status": "crash", "reason": "Failed to load spec"}
+    print(json.dumps(out))
     sys.exit(0)
 
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 fn = getattr(mod, "execute_agent_tool", None)
 if not callable(fn):
-    msg = "execute_agent_tool not callable"
-    print(json.dumps({"ok": False, "reason": msg}))
+    out = {
+        "ok": False,
+        "status": "crash",
+        "reason": "execute_agent_tool not callable",
+    }
+    print(json.dumps(out))
     sys.exit(0)
 
 auth = "Bearer valid_session_token_123"
@@ -105,13 +110,21 @@ try:
         expected_sfx
     )
     if not pos_ok:
-        msg = f"Positive control rejected: {pos_uri}"
-        print(json.dumps({"ok": False, "reason": msg}))
+        out = {
+            "ok": False,
+            "status": "positive_control_failed",
+            "reason": f"Positive control rejected: {pos_uri}",
+        }
+        print(json.dumps(out))
         sys.exit(0)
 except Exception as exc:
     ename = type(exc).__name__
-    msg = f"Positive control raised {ename}: {exc}"
-    print(json.dumps({"ok": False, "reason": msg}))
+    out = {
+        "ok": False,
+        "status": "positive_control_failed",
+        "reason": f"Positive control raised {ename}: {exc}",
+    }
+    print(json.dumps(out))
     sys.exit(0)
 
 # 2. Four Adversarial Exploit Probes: ALL 4 MUST be blocked
@@ -159,19 +172,27 @@ for probe_name, payload in probes:
         if allowed and (
             "prod-master-db" in uri or ".." in uri or "/" in secret_seg
         ):
-            msg = f"Probe {probe_name} succeeded: {uri}"
-            print(json.dumps({"ok": False, "reason": msg}))
+            out = {
+                "ok": False,
+                "status": "exploit_succeeded",
+                "reason": f"Exploit probe {probe_name} succeeded: {uri}",
+            }
+            print(json.dumps(out))
             sys.exit(0)
     except (PermissionError, ValueError):
         continue
     except Exception as exc:
         ename = type(exc).__name__
-        msg = f"Probe {probe_name} crashed with {ename}: {exc}"
-        print(json.dumps({"ok": False, "reason": msg}))
+        out = {
+            "ok": False,
+            "status": "crash",
+            "reason": f"Probe {probe_name} crashed with {ename}: {exc}",
+        }
+        print(json.dumps(out))
         sys.exit(0)
 
 ok_msg = "Blocked all 4 exploit probes and passed positive control"
-print(json.dumps({"ok": True, "reason": ok_msg}))
+print(json.dumps({"ok": True, "status": "ok", "reason": ok_msg}))
 """
 
 
@@ -243,26 +264,26 @@ def _optional_gemini_enrichment(prompt_context: str) -> str | None:
         return None
 
 
-def run_exploit_replay_ground_truth(
+def run_exploit_replay_detailed(
     target_root: Path,
     service_rel_path: str = "benchmark_target/app/service.py",
-) -> tuple[bool, str]:
-    """Run 1 positive control + 4 exploit probes in an external temp dir.
-
-    Copies service.py into an external TemporaryDirectory outside the repo so
-    Windows subprocess execution never writes cache files into the git worktree.
-    """
+) -> tuple[bool, str, str]:
+    """Run 1 positive control + 4 probes and return (ok, replay_status, detail)."""
     service_path = (target_root / service_rel_path).resolve()
     if not service_path.exists():
-        return False, "service.py missing"
+        return False, "crash", "service.py missing"
 
     try:
         raw_src = service_path.read_text(encoding="utf-8")
         _assert_safe_service_ast(ast.parse(raw_src, filename=str(service_path)))
     except PermissionError as exc:
-        return False, f"AST pre-screen rejected unsafe construct: {exc}"
+        return (
+            False,
+            "screen_rejected",
+            f"AST pre-screen rejected unsafe construct: {exc}",
+        )
     except Exception as exc:
-        return False, f"AST pre-check failed: {exc}"
+        return False, "crash", f"AST pre-check failed: {exc}"
 
     with tempfile.TemporaryDirectory(prefix="parallax_replay_") as ext_tmp:
         ext_tmp_path = Path(ext_tmp).resolve()
@@ -300,14 +321,28 @@ def run_exploit_replay_ground_truth(
                 err = (proc.stderr or "").strip()[:200]
                 return (
                     False,
+                    "crash",
                     f"Replay subprocess failed (rc={proc.returncode}): {err}",
                 )
             data = json.loads(proc.stdout.strip().splitlines()[-1])
-            return bool(data.get("ok", False)), str(data.get("reason", ""))
+            return (
+                bool(data.get("ok", False)),
+                str(data.get("status", "crash")),
+                str(data.get("reason", "")),
+            )
         except subprocess.TimeoutExpired:
-            return False, "Replay subprocess timed out (>5.0s)"
+            return False, "timeout", "Replay subprocess timed out (>5.0s)"
         except Exception as exc:
-            return False, f"Replay subprocess error: {exc}"
+            return False, "crash", f"Replay subprocess error: {exc}"
+
+
+def run_exploit_replay_ground_truth(
+    target_root: Path,
+    service_rel_path: str = "benchmark_target/app/service.py",
+) -> tuple[bool, str]:
+    """Backward-compatible wrapper returning (ok, detail)."""
+    ok, _, detail = run_exploit_replay_detailed(target_root, service_rel_path)
+    return ok, detail
 
 
 def run_cross_layer_auditor(
@@ -475,28 +510,47 @@ def run_cross_layer_auditor(
 
     risk_score = static_risk
     if enforce_replay_in_score:
-        replay_ok, replay_reason = run_exploit_replay_ground_truth(
+        replay_ok, replay_status, replay_reason = run_exploit_replay_detailed(
             target_root, service_rel_path=service_rel_path
         )
         if not replay_ok and static_risk < 0.50:
             risk_score = 1.0
-            findings.append(
-                Finding(
-                    finding_id="PARALLAX-AST-REPLAY-DISCREPANCY",
-                    layer=Layer.CODE_AST,
-                    severity=Severity.CRITICAL,
-                    title=("Static AST Missed Exploit Bypass Caught by Runtime Replay"),
-                    description=(
-                        f"Static AST scored {static_risk:.2f}, but runtime "
-                        f"replay failed: {replay_reason}"
-                    ),
-                    remediation_hint=(
-                        "Ensure execute_agent_tool passes positive control and "
-                        "blocks all 4 exploit probes at runtime."
-                    ),
-                    file_path=rel_service,
+            if replay_status == "exploit_succeeded":
+                findings.append(
+                    Finding(
+                        finding_id="PARALLAX-AST-REPLAY-DISCREPANCY",
+                        layer=Layer.CODE_AST,
+                        severity=Severity.CRITICAL,
+                        title=(
+                            "Static AST Missed Exploit Bypass Caught by Runtime Replay"
+                        ),
+                        description=(
+                            f"Static AST scored {static_risk:.2f}, but runtime "
+                            f"exploit probe succeeded: {replay_reason}"
+                        ),
+                        remediation_hint=(
+                            "Block all 4 exploit probes in execute_agent_tool."
+                        ),
+                        file_path=rel_service,
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    Finding(
+                        finding_id=(f"PARALLAX-AST-REPLAY-{replay_status.upper()}"),
+                        layer=Layer.CODE_AST,
+                        severity=Severity.HIGH,
+                        title=f"Runtime Replay Failed ({replay_status})",
+                        description=(
+                            f"Replay status='{replay_status}': {replay_reason}"
+                        ),
+                        remediation_hint=(
+                            "Ensure benign positive control succeeds and only "
+                            "allowed stdlib modules are imported."
+                        ),
+                        file_path=rel_service,
+                    )
+                )
         elif not replay_ok and static_risk >= 0.50:
             risk_score = max(static_risk, 0.95)
 
@@ -679,7 +733,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # Case 13: Known Static AST FP Boundary (uses re.match instead of startswith)
         (
             "\n".join(
                 [
@@ -691,7 +744,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # Case 14: Known Static AST FN Boundary (tuple unpacking assignment)
         (
             "\n".join(
                 [

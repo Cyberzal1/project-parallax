@@ -1,6 +1,6 @@
 [project]
 name = "project-parallax"
-version = "0.6.0"
+version = "0.7.0"
 description = "Adversarial Cloud Architecture & Split-Brain Patch Verification Engine for GCP"
 readme = "README.md"
 requires-python = ">=3.13"

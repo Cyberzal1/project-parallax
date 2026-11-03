@@ -1,21 +1,10 @@
 terraform {
-  required_version = ">= 1.9.0"
-  required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 6.0"
-    }
-  }
-}
-
-variable "project_id" {
-  type    = string
-  default = "gcp-sg-parallax-sandbox"
+  required_version = ">= 1.6.0"
 }
 
 resource "google_service_account" "sa_agent_runner" {
   account_id   = "sa-agent-runner"
-  display_name = "Vertex AI Workspace Ops Agent Service Account"
+  display_name = "Vertex AI Ops Agent Service Account"
 }
 
 resource "google_cloud_run_v2_service" "vertex_ops_agent" {
@@ -26,21 +15,23 @@ resource "google_cloud_run_v2_service" "vertex_ops_agent" {
   template {
     service_account = google_service_account.sa_agent_runner.email
     containers {
-      image = "asia-southeast1-docker.pkg.dev/gcp-sg-parallax-sandbox/agents/vertex-ops:1.0.0"
+      image = "asia-southeast1-docker.pkg.dev/gcp-sg-parallax-sandbox/agents/v:1"
     }
   }
 }
 
-# [FLAW] Project-wide SecretAccessor binding granting access to ALL secrets
-resource "google_project_iam_member" "project_secret_accessor" {
-  project = var.project_id
+resource "google_secret_manager_secret" "workspace_doc_quarterly_notes" {
+  secret_id = "workspace-doc-quarterly-notes"
+}
+
+resource "google_project_iam_member" "agent_secret_accessor" {
+  project = "gcp-sg-parallax-sandbox"
   role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.sa_agent_runner.email}"
 }
 
-# [FLAW] Project-wide TokenCreator binding allowing transitive SA impersonation
-resource "google_project_iam_member" "project_token_creator" {
-  project = var.project_id
+resource "google_project_iam_member" "agent_token_creator" {
+  project = "gcp-sg-parallax-sandbox"
   role    = "roles/iam.serviceAccountTokenCreator"
   member  = "serviceAccount:${google_service_account.sa_agent_runner.email}"
 }

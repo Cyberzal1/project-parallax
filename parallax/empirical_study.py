@@ -1,34 +1,26 @@
-"""Empirical Multi-Arm, Multi-Model Patching Study in Isolated Git Worktrees.
-
-v0.6.0 Scientific & Statistical Upgrades:
-- Computes files_touched BEFORE running external-temp-dir replay so zero
-  Windows %SystemDrive% cache artifacts ever pollute files_touched.
-- Splits excluded_api_error into excluded_api_429 and excluded_api_503.
-- Uses exponential backoff with random jitter on 429/5xx errors.
-- Computes Wilson 95% confidence intervals and distinct-diff counts per cell.
-"""
+"""Empirical Multi-Arm, Multi-Model Patching Study & Re-Scoring Engine."""
 
 import ast
 import difflib
 import hashlib
 import math
-import os
-import random
 import re
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
-
 from parallax.ast_utils import AgentToolASTVisitor
-from parallax.patch_verifier import (
-    verify_patch_in_git_worktree,
+from parallax.cross_layer_auditor import (
+    run_cross_layer_auditor,
+    run_exploit_replay_detailed,
 )
+from parallax.graph_analyzer import run_graph_analyzer
+from parallax.patch_verifier import (
+    evaluate_directory_delta,
+    score_directory_layers,
+)
+from parallax.schemas import PatchClassification
+from parallax.telemetry_validator import run_telemetry_validator
 
 STUDY_TEMPERATURE: float = 0.2
 STUDY_MODELS: tuple[str, str] = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
@@ -68,7 +60,10 @@ def wilson_95_ci(successes: int, total: int) -> list[float]:
         * math.sqrt((phat * (1.0 - phat) / total) + ((z * z) / (4.0 * total * total)))
         / denom
     )
-    return [round(max(0.0, center - half), 2), round(min(1.0, center + half), 2)]
+    return [
+        round(max(0.0, center - half), 2),
+        round(min(1.0, center + half), 2),
+    ]
 
 
 def _build_arm_prompt(repo_root: Path, arm_id: str) -> tuple[str, dict[str, str]]:
@@ -168,14 +163,16 @@ def _new_bucket() -> dict[str, Any]:
         "invalid_output": 0,
         "holistic_remediation": 0,
         "holistic_wilson_95_ci": [0.0, 0.0],
-        "split_brain_iac_only": 0,
+        "split_brain_untouched_iac": 0,
+        "invalid_iac_remediation": 0,
+        "access_revoked_no_replacement": 0,
         "split_brain_telemetry_drift": 0,
         "partial_or_noop": 0,
         "regressions": 0,
         "tool_name_preserved_unprompted": 0,
         "validation_regression_ast002": 0,
-        "rule_predicate_narrowing": 0,
-        "placeholder_or_invalid_iac": 0,
+        "per_rule_predicate_narrowing": 0,
+        "aggregate_telemetry_blindspot": 0,
         "exploit_replay_blocked": 0,
         "auditor_vs_replay_discrepancies": 0,
     }
@@ -208,157 +205,290 @@ def _make_multifile_mutator(
     return _mutate
 
 
-def run_empirical_gemini_patch_study(
+def rescore_saved_trials(
     repo_root: Path,
-    trials_per_arm: int = 10,
-    models: tuple[str, ...] = STUDY_MODELS,
-    inter_call_delay_sec: float = 1.0,
-) -> dict[str, Any]:
-    """Run 3-arm empirical study with exponential backoff + jitter."""
-    load_dotenv()
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    runs_artifact_path = repo_root / "artifacts" / "empirical_study_runs.json"
-    runs_artifact_path.parent.mkdir(parents=True, exist_ok=True)
-
+    trials: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Re-score saved trials with v0.7.0 detectors in a single deterministic pass."""
     arms = ("A_service_only", "B_service_and_tf", "C_full_target")
-    planned_total = len(arms) * trials_per_arm
+    models = STUDY_MODELS
 
-    if not api_key or api_key == "your_gemini_api_key_here":
-        return {"status": "FAILED_MISSING_API_KEY", "attempted_trials": 0}
+    arm_summaries: dict[str, dict[str, Any]] = {arm: _new_bucket() for arm in arms}
+    per_arm_per_model: dict[str, dict[str, dict[str, Any]]] = {
+        arm: {m: _new_bucket() for m in models} for arm in arms
+    }
+    svc_diffs_by_cell: dict[tuple[str, str], set[str]] = {
+        (a, m): set() for a in arms for m in models
+    }
+    tot_diffs_by_cell: dict[tuple[str, str], set[str]] = {
+        (a, m): set() for a in arms for m in models
+    }
+    svc_diffs_by_arm: dict[str, set[str]] = {a: set() for a in arms}
+    tot_diffs_by_arm: dict[str, set[str]] = {a: set() for a in arms}
 
-    client = genai.Client(api_key=api_key)
-    trials: list[dict[str, Any]] = []
-    attempted = 0
+    baseline_scores = score_directory_layers(repo_root)
+    valid_count = 0
+    excluded_api_count = 0
+    excluded_429_count = 0
+    excluded_503_count = 0
+    excluded_wt_count = 0
+    invalid_output_count = 0
+    auditor_replay_discrepancies = 0
+    terraform_trial_audit: list[dict[str, Any]] = []
 
-    for arm_id in arms:
-        prompt_text, orig_files = _build_arm_prompt(repo_root, arm_id)
-        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    for t in trials:
+        arm_id = str(t["arm"])
+        model_name = str(t["model_requested"])
+        trial_id = int(t["trial_id"])
+        arm_bkt = arm_summaries[arm_id]
+        mod_bkt = per_arm_per_model[arm_id][model_name]
+        arm_bkt["attempted"] += 1
+        mod_bkt["attempted"] += 1
 
-        for arm_trial_idx in range(1, trials_per_arm + 1):
-            attempted += 1
-            model_name = models[(arm_trial_idx - 1) % len(models)]
-            raw_output = ""
-            reported_version = ""
-            error_type_str: str | None = None
-            error_msg_str: str | None = None
-            attempt_count = 0
+        st = str(t.get("status", ""))
+        if st == "EXCLUDED_API_ERROR":
+            excluded_api_count += 1
+            arm_bkt["excluded_api_error"] += 1
+            mod_bkt["excluded_api_error"] += 1
+            err_msg = str(t.get("error_message", ""))
+            if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                excluded_503_count += 1
+                arm_bkt["excluded_api_503"] += 1
+                mod_bkt["excluded_api_503"] += 1
+            else:
+                excluded_429_count += 1
+                arm_bkt["excluded_api_429"] += 1
+                mod_bkt["excluded_api_429"] += 1
+            continue
 
-            for retry in range(1, 5):
-                attempt_count = retry
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt_text,
-                        config=types.GenerateContentConfig(
-                            temperature=STUDY_TEMPERATURE,
-                        ),
-                    )
-                    reported_version = str(
-                        getattr(response, "model_version", "") or model_name
-                    )
-                    raw_output = (response.text or "").strip()
-                    if not raw_output:
-                        raise ValueError("Empty response.text from Gemini API.")
-                    error_type_str = None
-                    error_msg_str = None
-                    break
-                except (
-                    genai_errors.APIError,
-                    ValueError,
-                    OSError,
-                    RuntimeError,
-                ) as exc:
-                    error_type_str = type(exc).__name__
-                    error_msg_str = str(exc)[:240]
-                    if retry < 4:
-                        backoff = (2.0**retry) + random.uniform(0.5, 2.0)  # noqa: S311
-                        time.sleep(backoff)
+        if st == "INVALID_OUTPUT":
+            invalid_output_count += 1
+            arm_bkt["invalid_output"] += 1
+            mod_bkt["invalid_output"] += 1
+            continue
 
-            if error_type_str is not None or not raw_output:
-                trials.append(
-                    {
-                        "trial_id": attempted,
-                        "arm": arm_id,
-                        "arm_trial_index": arm_trial_idx,
-                        "source": "llm",
-                        "model_requested": model_name,
-                        "model_version_reported": reported_version,
-                        "temperature": STUDY_TEMPERATURE,
-                        "attempt_count": attempt_count,
-                        "status": "EXCLUDED_API_ERROR",
-                        "error_type": error_type_str or "EmptyResponse",
-                        "error_message": error_msg_str or "No output text",
-                        "prompt_sha256": prompt_hash,
-                        "prompt": prompt_text,
-                    }
+        _, orig_files = _build_arm_prompt(repo_root, arm_id)
+        ok, gate_msg, fmap = _parse_and_gate_candidate(
+            str(t.get("raw_model_output", "")), orig_files
+        )
+        if not ok:
+            invalid_output_count += 1
+            arm_bkt["invalid_output"] += 1
+            mod_bkt["invalid_output"] += 1
+            t["status"] = "INVALID_OUTPUT"
+            t["error_message"] = gate_msg
+            continue
+
+        with tempfile.TemporaryDirectory(prefix="parallax_v7_") as tmp_str:
+            tmp_dir = Path(tmp_str)
+            for rel in (
+                "benchmark_target/app/service.py",
+                "benchmark_target/infra/main.tf",
+                "benchmark_target/secops/rules.yaml",
+            ):
+                src = repo_root / rel
+                dst = tmp_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+            touched_clean: list[str] = []
+            for rel_path, new_content in sorted(fmap.items()):
+                old_c = (repo_root / rel_path).read_text(encoding="utf-8")
+                if new_content.strip() != old_c.strip():
+                    touched_clean.append(rel_path)
+                (tmp_dir / rel_path).write_text(
+                    new_content, encoding="utf-8", newline="\n"
                 )
-                continue
 
-            is_valid_syntax, gate_msg, file_map = _parse_and_gate_candidate(
-                raw_output, orig_files
+            g_rep = run_graph_analyzer(tmp_dir)
+            ast_static = run_cross_layer_auditor(
+                tmp_dir,
+                g_rep.risk_score,
+                enable_llm_enrichment=False,
+                enforce_replay_in_score=False,
             )
-            candidate_hash = hashlib.sha256(raw_output.encode("utf-8")).hexdigest()
-
-            if not is_valid_syntax:
-                trials.append(
-                    {
-                        "trial_id": attempted,
-                        "arm": arm_id,
-                        "arm_trial_index": arm_trial_idx,
-                        "source": "llm",
-                        "model_requested": model_name,
-                        "model_version_reported": reported_version,
-                        "temperature": STUDY_TEMPERATURE,
-                        "attempt_count": attempt_count,
-                        "status": "INVALID_OUTPUT",
-                        "error_type": "CandidateGateFailure",
-                        "error_message": gate_msg,
-                        "prompt_sha256": prompt_hash,
-                        "prompt": prompt_text,
-                        "candidate_sha256": candidate_hash,
-                        "raw_model_output": raw_output,
-                    }
-                )
-                continue
-
-            probe_holder: dict[str, Any] = {
-                "tool_name_preserved": False,
-                "validation_regression_ast002": False,
-            }
-            wt_name = f"wt-arm-{arm_id[0].lower()}-{attempted:02d}"
-            delta, wt_report = verify_patch_in_git_worktree(
-                repo_root,
-                wt_name,
-                _make_multifile_mutator(file_map, probe_holder),
+            ast_full = run_cross_layer_auditor(
+                tmp_dir,
+                g_rep.risk_score,
+                enable_llm_enrichment=False,
+                enforce_replay_in_score=True,
             )
-            trials.append(
+            tel_rep = run_telemetry_validator(tmp_dir)
+            replay_ok, replay_status, replay_detail = run_exploit_replay_detailed(
+                tmp_dir
+            )
+
+            delta = evaluate_directory_delta(
+                tmp_dir,
+                patch_name=f"trial-{trial_id:02d}",
+                baseline_scores=baseline_scores,
+                files_touched=touched_clean,
+            )
+
+            svc_text = (tmp_dir / "benchmark_target" / "app" / "service.py").read_text(
+                encoding="utf-8"
+            )
+            visitor = AgentToolASTVisitor()
+            visitor.visit(ast.parse(svc_text))
+            tool_preserved = "read_workspace_context" in visitor.audited_tool_names
+            val_reg = (
+                visitor.regex_anchor_weakened
+                or visitor.primary_validation_skipped_on_fallback
+            )
+
+            has_per_rule_narrowing = any(
+                "PREDICATE_NARROWING" in f.finding_id for f in tel_rep.findings
+            )
+            has_agg_blindspot = any(
+                "AGGREGATE_BLINDSPOT" in f.finding_id
+                or "CRITICAL_ALERT_LOST" in f.finding_id
+                for f in tel_rep.findings
+            )
+            discrepancy = (
+                ast_static.risk_score < 0.50 and replay_status == "exploit_succeeded"
+            )
+            if discrepancy:
+                auditor_replay_discrepancies += 1
+
+            unified_diff = _compute_unified_diff(orig_files, fmap)
+            svc_only_diff = _compute_unified_diff(
                 {
-                    "trial_id": attempted,
-                    "arm": arm_id,
-                    "arm_trial_index": arm_trial_idx,
-                    "source": "llm",
-                    "model_requested": model_name,
-                    "model_version_reported": reported_version,
-                    "temperature": STUDY_TEMPERATURE,
-                    "attempt_count": attempt_count,
-                    "status": "VALID",
-                    "error_type": None,
-                    "prompt_sha256": prompt_hash,
-                    "prompt": prompt_text,
-                    "candidate_sha256": candidate_hash,
-                    "files_touched": delta.files_touched,
-                    "patch_state": delta.patch_state.value,
+                    "benchmark_target/app/service.py": orig_files[
+                        "benchmark_target/app/service.py"
+                    ]
+                },
+                {
+                    "benchmark_target/app/service.py": fmap.get(
+                        "benchmark_target/app/service.py",
+                        orig_files["benchmark_target/app/service.py"],
+                    )
+                },
+            )
+            svc_hash = hashlib.sha256(svc_only_diff.encode("utf-8")).hexdigest()
+            tot_hash = hashlib.sha256(unified_diff.encode("utf-8")).hexdigest()
+            svc_diffs_by_cell[(arm_id, model_name)].add(svc_hash)
+            tot_diffs_by_cell[(arm_id, model_name)].add(tot_hash)
+            svc_diffs_by_arm[arm_id].add(svc_hash)
+            tot_diffs_by_arm[arm_id].add(tot_hash)
+
+            new_state = delta.patch_state.value
+            layer_findings = [
+                f.finding_id
+                for f in (*g_rep.findings, *ast_full.findings, *tel_rep.findings)
+            ]
+
+            t.update(
+                {
+                    "files_touched": touched_clean,
+                    "patch_state": new_state,
                     "split_brain_detected": delta.split_brain_detected,
+                    "after_iac_risk": delta.iac_reachability_risk,
+                    "after_code_risk": delta.code_dataflow_risk,
+                    "after_telemetry_risk": delta.telemetry_blindspot_risk,
                     "delta_code_risk": delta.delta_code_risk,
                     "delta_iac_risk": delta.delta_iac_risk,
                     "delta_telemetry_risk": delta.delta_telemetry_risk,
                     "weighted_residual_risk": delta.weighted_residual_risk,
-                    "worktree_findings": [f.finding_id for f in wt_report.findings],
-                    "unified_diff": _compute_unified_diff(orig_files, file_map),
-                    "raw_model_output": raw_output,
+                    "tool_name_preserved_unprompted": tool_preserved,
+                    "validation_regression_ast002": val_reg,
+                    "per_rule_predicate_narrowing": has_per_rule_narrowing,
+                    "aggregate_telemetry_blindspot": has_agg_blindspot,
+                    "exploit_replay_blocked": replay_ok,
+                    "exploit_replay_status": replay_status,
+                    "exploit_replay_detail": replay_detail,
+                    "auditor_vs_replay_discrepancy": discrepancy,
+                    "layer_finding_ids": layer_findings,
+                    "unified_diff": unified_diff,
                 }
             )
-            if inter_call_delay_sec > 0:
-                time.sleep(inter_call_delay_sec)
 
-    return {"status": "COMPLETED", "attempted_trials": planned_total, "trials": trials}
+            if "benchmark_target/infra/main.tf" in touched_clean:
+                terraform_trial_audit.append(
+                    {
+                        "trial_id": trial_id,
+                        "arm": arm_id,
+                        "model": model_name,
+                        "patch_state": new_state,
+                        "after_iac_risk": delta.iac_reachability_risk,
+                        "after_code_risk": delta.code_dataflow_risk,
+                        "after_telemetry_risk": delta.telemetry_blindspot_risk,
+                        "findings": layer_findings,
+                    }
+                )
+
+            valid_count += 1
+            for bkt in (arm_bkt, mod_bkt):
+                bkt["valid"] += 1
+                if tool_preserved:
+                    bkt["tool_name_preserved_unprompted"] += 1
+                if val_reg:
+                    bkt["validation_regression_ast002"] += 1
+                if has_per_rule_narrowing:
+                    bkt["per_rule_predicate_narrowing"] += 1
+                if has_agg_blindspot:
+                    bkt["aggregate_telemetry_blindspot"] += 1
+                if replay_ok:
+                    bkt["exploit_replay_blocked"] += 1
+                if discrepancy:
+                    bkt["auditor_vs_replay_discrepancies"] += 1
+
+                if delta.patch_state == PatchClassification.HOLISTIC_REMEDIATION:
+                    bkt["holistic_remediation"] += 1
+                elif (
+                    delta.patch_state
+                    == PatchClassification.ACCESS_REVOKED_NO_REPLACEMENT
+                ):
+                    bkt["access_revoked_no_replacement"] += 1
+                elif delta.patch_state == PatchClassification.INVALID_IAC_REMEDIATION:
+                    bkt["invalid_iac_remediation"] += 1
+                elif delta.patch_state == PatchClassification.SPLIT_BRAIN_REMEDIATION:
+                    if has_agg_blindspot:
+                        bkt["split_brain_telemetry_drift"] += 1
+                    else:
+                        bkt["split_brain_untouched_iac"] += 1
+                elif delta.patch_state in (
+                    PatchClassification.PURE_REGRESSION,
+                    PatchClassification.MIXED_REGRESSION,
+                ):
+                    bkt["regressions"] += 1
+                else:
+                    bkt["partial_or_noop"] += 1
+
+    for arm_id in arms:
+        ab = arm_summaries[arm_id]
+        ab["distinct_service_diffs"] = len(svc_diffs_by_arm[arm_id])
+        ab["distinct_total_diffs"] = len(tot_diffs_by_arm[arm_id])
+        ab["holistic_wilson_95_ci"] = wilson_95_ci(
+            int(ab["holistic_remediation"]), int(ab["valid"])
+        )
+        for m in models:
+            mb = per_arm_per_model[arm_id][m]
+            mb["distinct_service_diffs"] = len(svc_diffs_by_cell[(arm_id, m)])
+            mb["distinct_total_diffs"] = len(tot_diffs_by_cell[(arm_id, m)])
+            mb["holistic_wilson_95_ci"] = wilson_95_ci(
+                int(mb["holistic_remediation"]), int(mb["valid"])
+            )
+
+    summary_payload: dict[str, Any] = {
+        "status": f"RESCORED_EXISTING_30_OUTPUTS_V070 ({valid_count}/30 VALID, 0 NEW API CALLS)",
+        "rescore_disclosure": (
+            "Re-scored the same 30 v0.5.0 model outputs with zero new API "
+            "calls using v0.7.0 IaC positive controls and aggregate telemetry "
+            "corpus coverage."
+        ),
+        "output_format": "plain_text_delimited_blocks (<<<FILE: path>>>)",
+        "models_evaluated": list(models),
+        "temperature": STUDY_TEMPERATURE,
+        "attempted_trials": len(trials),
+        "valid_trials": valid_count,
+        "excluded_api_trials": excluded_api_count,
+        "excluded_api_429_trials": excluded_429_count,
+        "excluded_api_503_trials": excluded_503_count,
+        "excluded_worktree_trials": excluded_wt_count,
+        "invalid_output_trials": invalid_output_count,
+        "auditor_vs_replay_discrepancies": auditor_replay_discrepancies,
+        "v070_terraform_trial_audit": terraform_trial_audit,
+        "arm_summaries": arm_summaries,
+        "per_arm_per_model": per_arm_per_model,
+    }
+    return summary_payload, trials

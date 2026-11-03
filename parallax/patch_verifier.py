@@ -132,11 +132,11 @@ def _detect_git_touched_files(wt_dir: Path) -> tuple[list[str], list[str]]:
 
 def _select_finding_file_path(delta: SplitBrainDelta) -> str:
     """Point finding file_path at the specific layer that regressed/stayed open."""
-    if delta.delta_telemetry_risk > REGRESSION_TOLERANCE:
+    if delta.delta_telemetry_risk > 0.25:
         return "benchmark_target/secops/rules.yaml"
     if (
         delta.delta_iac_risk > REGRESSION_TOLERANCE
-        or delta.iac_reachability_risk >= HIGH_RISK_THRESHOLD
+        or delta.iac_reachability_risk >= 0.60
     ):
         return "benchmark_target/infra/main.tf"
     if delta.delta_code_risk > REGRESSION_TOLERANCE:
@@ -154,7 +154,7 @@ def evaluate_directory_delta(
     baseline_scores: tuple[float, float, float],
     files_touched: list[str] | None = None,
 ) -> SplitBrainDelta:
-    """Compute before/after Split-Brain Security Delta with required baseline."""
+    """Compute before/after Split-Brain Security Delta with 8-state precision."""
     before_iac, before_code, before_tel = baseline_scores
     after_iac, after_code, after_tel = score_directory_layers(worktree_root)
 
@@ -169,18 +169,19 @@ def evaluate_directory_delta(
         2,
     )
 
+    observed_files = files_touched if files_touched is not None else []
+    tf_was_edited = "benchmark_target/infra/main.tf" in observed_files
+
     is_noop = d_iac == 0.0 and d_code == 0.0 and d_tel == 0.0
     code_improved = d_code <= -MIN_CODE_IMPROVEMENT and after_code < 0.50
     minor_code_gain = -MIN_CODE_IMPROVEMENT < d_code < -REGRESSION_TOLERANCE
     any_layer_regressed = (
-        d_iac > REGRESSION_TOLERANCE
-        or d_code > REGRESSION_TOLERANCE
-        or d_tel > REGRESSION_TOLERANCE
+        d_iac > REGRESSION_TOLERANCE or d_code > REGRESSION_TOLERANCE or d_tel > 0.25
     )
-    iac_unfixed = after_iac >= HIGH_RISK_THRESHOLD
-    tel_unfixed_or_regressed = d_tel > REGRESSION_TOLERANCE or (
-        d_tel >= 0.0 and after_tel >= HIGH_RISK_THRESHOLD
-    )
+    iac_untouched_open = not tf_was_edited and after_iac >= HIGH_RISK_THRESHOLD
+    iac_invalid_edit = tf_was_edited and after_iac >= 0.65
+    iac_access_revoked = after_iac == 0.60
+    tel_blindspot = d_tel > 0.25 or after_tel >= HIGH_RISK_THRESHOLD
     all_clean = (
         after_iac < CLEAN_RISK_THRESHOLD
         and after_code < CLEAN_RISK_THRESHOLD
@@ -199,9 +200,26 @@ def evaluate_directory_delta(
         patch_state = PatchClassification.HOLISTIC_REMEDIATION
         summary = (
             f"[{patch_name}] Full Root-Cause Architectural Remediation verified "
-            "across Code AST, GCP Terraform IAM, and SecOps Telemetry."
+            "across Code AST, GCP Terraform IAM (with positive control), and "
+            "SecOps Telemetry."
         )
-    elif code_improved and (iac_unfixed or tel_unfixed_or_regressed):
+    elif code_improved and iac_access_revoked and not tel_blindspot:
+        patch_state = PatchClassification.ACCESS_REVOKED_NO_REPLACEMENT
+        summary = (
+            f"[{patch_name}] ACCESS REVOKED WITHOUT REPLACEMENT: Code fixed, "
+            "but main.tf removed project IAM bindings without adding a valid "
+            f"scoped secret binding (IaC Risk={after_iac:.2f})."
+        )
+    elif code_improved and iac_invalid_edit:
+        split_brain = True
+        patch_state = PatchClassification.INVALID_IAC_REMEDIATION
+        summary = (
+            f"[{patch_name}] INVALID IAC REMEDIATION: Code fixed, but main.tf "
+            f"edit used invalid resource types, undeclared/placeholder secrets, "
+            f"or retained privileged roles (IaC Risk={after_iac:.2f}, "
+            f"Telemetry Risk={after_tel:.2f})."
+        )
+    elif code_improved and (iac_untouched_open or tel_blindspot):
         split_brain = True
         patch_state = PatchClassification.SPLIT_BRAIN_REMEDIATION
         summary = (
@@ -230,8 +248,6 @@ def evaluate_directory_delta(
             f"{residual_risk:.2f}, d_iac={d_iac:+.2f}, d_code={d_code:+.2f}, "
             f"d_tel={d_tel:+.2f})."
         )
-
-    observed_files = files_touched if files_touched is not None else []
 
     return SplitBrainDelta(
         patch_name=patch_name,
@@ -286,11 +302,14 @@ def verify_patch_in_git_worktree(
         findings: list[Finding] = []
         target_file_path = _select_finding_file_path(delta)
 
-        if delta.split_brain_detected:
+        if delta.split_brain_detected or delta.patch_state in (
+            PatchClassification.ACCESS_REVOKED_NO_REPLACEMENT,
+            PatchClassification.INVALID_IAC_REMEDIATION,
+        ):
             finding_sev = (
                 Severity.CRITICAL
                 if (
-                    delta.delta_telemetry_risk > REGRESSION_TOLERANCE
+                    delta.delta_telemetry_risk > 0.25
                     and delta.iac_reachability_risk >= 0.80
                 )
                 else Severity.HIGH
@@ -300,11 +319,14 @@ def verify_patch_in_git_worktree(
                     finding_id=f"PARALLAX-WT-{clean_id}",
                     layer=Layer.PATCH_WORKTREE,
                     severity=finding_sev,
-                    title=f"Split-Brain AI Patch Divergence in '{worktree_name}'",
+                    title=(
+                        f"Cross-Layer Patch Divergence ({delta.patch_state.value}) "
+                        f"in '{worktree_name}'"
+                    ),
                     description=delta.summary,
                     remediation_hint=(
-                        "Coordinate code remediation with Terraform least-privilege "
-                        "IAM and SecOps rule synchronization before merging."
+                        "Coordinate code remediation with valid Terraform "
+                        "least-privilege IAM and SecOps rule synchronization."
                     ),
                     file_path=target_file_path,
                 )

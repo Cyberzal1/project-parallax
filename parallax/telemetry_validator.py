@@ -9,6 +9,8 @@ import yaml
 from parallax.ast_utils import AgentToolASTVisitor
 from parallax.schemas import Finding, Layer, Severity, SubagentReport
 
+REPO_ROOT: Path = Path(__file__).resolve().parent.parent
+
 SEVERITY_WEIGHTS: dict[Severity, float] = {
     Severity.CRITICAL: 1.0,
     Severity.HIGH: 0.7,
@@ -41,7 +43,7 @@ BASELINE_SECURITY_EVENT_CORPUS: list[tuple[str, dict[str, Any]]] = [
         },
     ),
     (
-        "prod_Signing_key_exfiltration",
+        "prod_signing_key_exfiltration",
         {
             "event_type": "SECRET_MANAGER_ACCESS",
             "tool_name": "read_workspace_context",
@@ -68,18 +70,6 @@ BASELINE_SECURITY_EVENT_CORPUS: list[tuple[str, dict[str, Any]]] = [
     ),
 ]
 
-DEFAULT_BASELINE_RULES: dict[str, dict[str, Any]] = {
-    "SECOPS_GCP_001": {
-        "event_type": "SECRET_MANAGER_ACCESS",
-        "tool_name": "read_workspace_context",
-    },
-    "SECOPS_GCP_002": {
-        "event_type": "SECRET_MANAGER_ACCESS",
-        "tool_name": "read_workspace_context",
-        "target_secret_prefix": "prod-",
-    },
-}
-
 
 def _parse_severity(raw_sev: str) -> Severity:
     """Safely map rule severity string to Severity enum."""
@@ -104,35 +94,22 @@ def _rule_matches_event(
     return True
 
 
-def _detect_corpus_replay_regression(
-    rule_id: str,
-    patched_match_block: dict[str, Any],
-    emitted_tool_names: set[str],
-    baseline_match_block: dict[str, Any] | None = None,
-) -> list[str]:
-    """Replay security event corpus before/after patch to detect rule narrowing.
-
-    Flags any corpus sample that fired on the baseline rule definition but no
-    longer fires on the patched rule definition (with emitted tool_name).
-    """
-    base_match = baseline_match_block or DEFAULT_BASELINE_RULES.get(rule_id)
-    if not base_match:
+def _load_pre_patch_baseline_rules(
+    baseline_rules_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Load pre-patch baseline rules dynamically from rules.yaml on disk."""
+    path = baseline_rules_path or (
+        REPO_ROOT / "benchmark_target" / "secops" / "rules.yaml"
+    )
+    if not path.exists():
         return []
-
-    lost_events: list[str] = []
-    for sample_name, base_sample in BASELINE_SECURITY_EVENT_CORPUS:
-        if not _rule_matches_event(base_match, base_sample):
-            continue
-        # Construct post-patch sample using actual emitted tool_names
-        matched_after = False
-        for tool in emitted_tool_names or {"<none>"}:
-            post_sample = {**base_sample, "tool_name": tool}
-            if _rule_matches_event(patched_match_block, post_sample):
-                matched_after = True
-                break
-        if not matched_after:
-            lost_events.append(sample_name)
-    return lost_events
+    try:
+        raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("rules"), list):
+            return [r for r in raw["rules"] if isinstance(r, dict)]
+    except Exception:
+        return []
+    return []
 
 
 def _evaluate_rule_against_emitted_samples(
@@ -156,8 +133,9 @@ def run_telemetry_validator(
     target_root: Path,
     service_rel_path: str = "benchmark_target/app/service.py",
     rules_rel_path: str = "benchmark_target/secops/rules.yaml",
+    baseline_rules_path: Path | None = None,
 ) -> SubagentReport:
-    """Verify bidirectional SecOps coverage, schema fields, and corpus replay."""
+    """Verify bidirectional SecOps coverage, schema fields, and aggregate corpus."""
     service_path = target_root / service_rel_path
     rules_path = target_root / rules_rel_path
 
@@ -320,10 +298,21 @@ def run_telemetry_validator(
             f"statically ({sites_str})."
         )
 
+    # Load pre-patch baseline rules from disk (not hardcoded constants)
+    pre_patch_rules = _load_pre_patch_baseline_rules(baseline_rules_path)
+    pre_patch_by_id: dict[str, dict[str, Any]] = {}
+    for pr in pre_patch_rules:
+        pid = str(pr.get("rule_id", "")).strip()
+        pmatch = pr.get("match")
+        if pid and isinstance(pmatch, dict):
+            pre_patch_by_id[pid] = pmatch
+
     monitored_tool_names: set[str] = set()
     seen_rule_ids: set[str] = set()
+    valid_post_rules: list[tuple[str, Severity, dict[str, Any]]] = []
     total_weight = 0.0
     broken_weight = 0.0
+    per_rule_narrowed_count = 0
 
     for idx, rule_obj in enumerate(rules_list, start=1):
         if not isinstance(rule_obj, dict):
@@ -447,32 +436,6 @@ def run_telemetry_validator(
                 "event_type matching is intentional."
             )
 
-        # General before/after corpus replay check (catches predicate narrowing)
-        if not rule_broken:
-            lost_corpus = _detect_corpus_replay_regression(
-                rule_id, match_block, emitted_tool_names
-            )
-            if lost_corpus:
-                rule_broken = True
-                findings.append(
-                    Finding(
-                        finding_id=f"TELEM_RULE_PREDICATE_NARROWING_{rule_id}",
-                        layer=Layer.SECOPS_TELEMETRY,
-                        severity=rule_sev,
-                        title=(f"SecOps Rule {rule_id} Blinded by Predicate Narrowing"),
-                        description=(
-                            f"Rule {rule_id} previously fired on baseline "
-                            f"corpus events {lost_corpus}, but no longer fires "
-                            "after patch."
-                        ),
-                        remediation_hint=(
-                            "Restore rule match predicates so baseline attack "
-                            "corpus events continue to trigger alerts."
-                        ),
-                        file_path=rel_rules,
-                    )
-                )
-
         if not rule_broken and not _evaluate_rule_against_emitted_samples(
             match_block,
             visitor.emitted_event_samples,
@@ -496,8 +459,107 @@ def run_telemetry_validator(
                 )
             )
 
+        # Check per-rule predicate narrowing against pre-patch rule definition
+        if not rule_broken and rule_id in pre_patch_by_id:
+            base_m = pre_patch_by_id[rule_id]
+            lost_for_this_rule: list[str] = []
+            for ev_name, ev_sample in BASELINE_SECURITY_EVENT_CORPUS:
+                if _rule_matches_event(base_m, ev_sample):
+                    still_matches = any(
+                        _rule_matches_event(
+                            match_block, {**ev_sample, "tool_name": t_name}
+                        )
+                        for t_name in (emitted_tool_names or {"<none>"})
+                    )
+                    if not still_matches:
+                        lost_for_this_rule.append(ev_name)
+            if lost_for_this_rule:
+                per_rule_narrowed_count += 1
+                findings.append(
+                    Finding(
+                        finding_id=f"TELEM_RULE_PREDICATE_NARROWING_{rule_id}",
+                        layer=Layer.SECOPS_TELEMETRY,
+                        severity=rule_sev,
+                        title=(f"SecOps Rule {rule_id} Narrowed on Corpus Events"),
+                        description=(
+                            f"Rule {rule_id} previously matched corpus events "
+                            f"{lost_for_this_rule}, but no longer matches them "
+                            "after patch."
+                        ),
+                        remediation_hint=(f"Restore match predicates on {rule_id}."),
+                        file_path=rel_rules,
+                    )
+                )
+
         if rule_broken:
             broken_weight += weight
+        else:
+            valid_post_rules.append((rule_id, rule_sev, match_block))
+
+    # Aggregate Corpus Coverage Check across all pre-patch vs post-patch rules
+    for ev_name, ev_sample in BASELINE_SECURITY_EVENT_CORPUS:
+        pre_any = any(
+            _rule_matches_event(pr.get("match", {}), ev_sample)
+            for pr in pre_patch_rules
+            if isinstance(pr.get("match"), dict)
+        )
+        pre_crit = any(
+            _parse_severity(str(pr.get("severity", "HIGH"))) == Severity.CRITICAL
+            and _rule_matches_event(pr.get("match", {}), ev_sample)
+            for pr in pre_patch_rules
+            if isinstance(pr.get("match"), dict)
+        )
+        post_any = any(
+            _rule_matches_event(m_blk, {**ev_sample, "tool_name": t_name})
+            for _, _, m_blk in valid_post_rules
+            for t_name in (emitted_tool_names or {"<none>"})
+        )
+        post_crit = any(
+            r_sev == Severity.CRITICAL
+            and _rule_matches_event(m_blk, {**ev_sample, "tool_name": t_name})
+            for _, r_sev, m_blk in valid_post_rules
+            for t_name in (emitted_tool_names or {"<none>"})
+        )
+
+        if pre_any and not post_any:
+            broken_weight += 1.0
+            total_weight += 1.0
+            findings.append(
+                Finding(
+                    finding_id=f"TELEM_AGGREGATE_BLINDSPOT_{ev_name.upper()}",
+                    layer=Layer.SECOPS_TELEMETRY,
+                    severity=Severity.CRITICAL,
+                    title=(f"Total Detection Blindspot on Corpus Event '{ev_name}'"),
+                    description=(
+                        f"Corpus event '{ev_name}' was detected by pre-patch "
+                        "rules.yaml, but ZERO rules fire on it after patch."
+                    ),
+                    remediation_hint=(
+                        "Ensure at least one active rule covers this event."
+                    ),
+                    file_path=rel_rules,
+                )
+            )
+        elif pre_crit and not post_crit:
+            broken_weight += 1.0
+            findings.append(
+                Finding(
+                    finding_id=f"TELEM_CRITICAL_ALERT_LOST_{ev_name.upper()}",
+                    layer=Layer.SECOPS_TELEMETRY,
+                    severity=Severity.HIGH,
+                    title=(f"CRITICAL Alert Tier Lost on Corpus Event '{ev_name}'"),
+                    description=(
+                        f"Corpus event '{ev_name}' previously triggered a "
+                        "CRITICAL alert in pre-patch rules.yaml, but no "
+                        "CRITICAL rule fires on it after patch."
+                    ),
+                    remediation_hint=(
+                        "Restore CRITICAL canary rule coverage for prod-* "
+                        "secret access."
+                    ),
+                    file_path=rel_rules,
+                )
+            )
 
     unmonitored_tools = sorted(emitted_tool_names - monitored_tool_names)
     for tool_name in unmonitored_tools:
@@ -527,11 +589,28 @@ def run_telemetry_validator(
         else 0.0
     )
     dynamic_penalty = 0.15 if visitor.unresolved_dynamic_tool_sites else 0.0
+    # If aggregate + critical corpus coverage is 100% intact, per-rule redundancy
+    # narrowing (e.g. SECOPS_GCP_001 narrowed while SECOPS_GCP_002 still catches
+    # prod-*) adds only a minor 0.10 penalty (0.05 -> 0.15)
+    redundancy_penalty = (
+        0.10 if (broken_ratio == 0.0 and per_rule_narrowed_count > 0) else 0.0
+    )
 
-    if broken_ratio == 0.0 and unmonitored_penalty == 0.0 and dynamic_penalty == 0.0:
+    if (
+        broken_ratio == 0.0
+        and unmonitored_penalty == 0.0
+        and dynamic_penalty == 0.0
+        and redundancy_penalty == 0.0
+    ):
         risk_score = 0.05
     else:
-        raw_score = 0.05 + (0.80 * broken_ratio) + unmonitored_penalty + dynamic_penalty
+        raw_score = (
+            0.05
+            + (0.80 * broken_ratio)
+            + unmonitored_penalty
+            + dynamic_penalty
+            + redundancy_penalty
+        )
         risk_score = round(min(0.95, raw_score), 2)
 
     return SubagentReport(
