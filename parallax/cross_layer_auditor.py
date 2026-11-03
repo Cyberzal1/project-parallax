@@ -3,8 +3,10 @@
 import ast
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,21 +26,49 @@ __all__ = [
 SAFE_REPLAY_IMPORTS: set[str] = {
     "collections",
     "collections.abc",
+    "copy",
     "dataclasses",
+    "datetime",
     "enum",
+    "functools",
+    "hashlib",
+    "hmac",
+    "itertools",
+    "json",
+    "logging",
+    "math",
+    "pathlib",
     "pydantic",
     "re",
     "typing",
+    "urllib.parse",
+    "uuid",
 }
 FORBIDDEN_REPLAY_CALLS: set[str] = {
     "__import__",
+    "breakpoint",
     "compile",
+    "delattr",
+    "dir",
     "eval",
     "exec",
+    "getattr",
     "globals",
     "input",
     "locals",
     "open",
+    "setattr",
+    "vars",
+}
+FORBIDDEN_DUNDER_ATTRS: set[str] = {
+    "__builtins__",
+    "__class__",
+    "__code__",
+    "__dict__",
+    "__globals__",
+    "__loader__",
+    "__spec__",
+    "__subclasses__",
 }
 
 REPLAY_RUNNER_SCRIPT: str = """
@@ -146,7 +176,7 @@ print(json.dumps({"ok": True, "reason": ok_msg}))
 
 
 def _assert_safe_service_ast(tree: ast.AST) -> None:
-    """Block unsafe imports, calls, or top-level execution in untrusted code."""
+    """Pre-screen untrusted code for disallowed imports, builtins, or dunders."""
     if not isinstance(tree, ast.Module):
         raise PermissionError("Root AST node must be a Module.")
     for stmt in tree.body:
@@ -180,6 +210,16 @@ def _assert_safe_service_ast(tree: ast.AST) -> None:
                 raise PermissionError(
                     f"Disallowed builtin call in replay: '{node.func.id}()'"
                 )
+        elif isinstance(node, ast.Attribute):
+            if node.attr in FORBIDDEN_DUNDER_ATTRS:
+                raise PermissionError(
+                    f"Disallowed dunder attribute in replay: '{node.attr}'"
+                )
+        elif isinstance(node, ast.Name):
+            if node.id in FORBIDDEN_DUNDER_ATTRS:
+                raise PermissionError(
+                    f"Disallowed dunder identifier in replay: '{node.id}'"
+                )
 
 
 def _optional_gemini_enrichment(prompt_context: str) -> str | None:
@@ -207,7 +247,11 @@ def run_exploit_replay_ground_truth(
     target_root: Path,
     service_rel_path: str = "benchmark_target/app/service.py",
 ) -> tuple[bool, str]:
-    """Run positive control + 4 exploit probes in a scrubbed subprocess."""
+    """Run 1 positive control + 4 exploit probes in an external temp dir.
+
+    Copies service.py into an external TemporaryDirectory outside the repo so
+    Windows subprocess execution never writes cache files into the git worktree.
+    """
     service_path = (target_root / service_rel_path).resolve()
     if not service_path.exists():
         return False, "service.py missing"
@@ -216,40 +260,54 @@ def run_exploit_replay_ground_truth(
         raw_src = service_path.read_text(encoding="utf-8")
         _assert_safe_service_ast(ast.parse(raw_src, filename=str(service_path)))
     except PermissionError as exc:
-        return False, f"AI Guardrail blocked unsafe AST: {exc}"
+        return False, f"AST pre-screen rejected unsafe construct: {exc}"
     except Exception as exc:
         return False, f"AST pre-check failed: {exc}"
 
-    scrubbed_env: dict[str, str] = {
-        "PATH": os.environ.get("PATH", ""),
-        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
-        "PYTHONPATH": str(target_root.resolve()),
-    }
-    try:
-        proc = subprocess.run(  # noqa: S603
-            [
-                sys.executable,
-                "-c",
-                REPLAY_RUNNER_SCRIPT,
-                str(service_path),
-            ],
-            cwd=str(target_root.resolve()),
-            env=scrubbed_env,
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            check=False,
-            encoding="utf-8",
-        )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            err = (proc.stderr or "").strip()[:200]
-            return False, f"Replay subprocess failed (rc={proc.returncode}): {err}"
-        data = json.loads(proc.stdout.strip().splitlines()[-1])
-        return bool(data.get("ok", False)), str(data.get("reason", ""))
-    except subprocess.TimeoutExpired:
-        return False, "Replay subprocess timed out (>5.0s)"
-    except Exception as exc:
-        return False, f"Replay subprocess error: {exc}"
+    with tempfile.TemporaryDirectory(prefix="parallax_replay_") as ext_tmp:
+        ext_tmp_path = Path(ext_tmp).resolve()
+        isolated_service = ext_tmp_path / "service_under_test.py"
+        shutil.copyfile(service_path, isolated_service)
+
+        scrubbed_env: dict[str, str] = {
+            "PATH": os.environ.get("PATH", ""),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+            "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", "C:"),
+            "TEMP": str(ext_tmp_path),
+            "TMP": str(ext_tmp_path),
+            "USERPROFILE": str(ext_tmp_path),
+            "LOCALAPPDATA": str(ext_tmp_path),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    REPLAY_RUNNER_SCRIPT,
+                    str(isolated_service),
+                ],
+                cwd=str(ext_tmp_path),
+                env=scrubbed_env,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+                encoding="utf-8",
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                err = (proc.stderr or "").strip()[:200]
+                return (
+                    False,
+                    f"Replay subprocess failed (rc={proc.returncode}): {err}",
+                )
+            data = json.loads(proc.stdout.strip().splitlines()[-1])
+            return bool(data.get("ok", False)), str(data.get("reason", ""))
+        except subprocess.TimeoutExpired:
+            return False, "Replay subprocess timed out (>5.0s)"
+        except Exception as exc:
+            return False, f"Replay subprocess error: {exc}"
 
 
 def run_cross_layer_auditor(
@@ -258,8 +316,9 @@ def run_cross_layer_auditor(
     service_rel_path: str = "benchmark_target/app/service.py",
     *,
     enable_llm_enrichment: bool = True,
+    enforce_replay_in_score: bool = True,
 ) -> SubagentReport:
-    """Execute Subagent 02 with fail-closed AST and validation-regression checks."""
+    """Execute Subagent 02 combining static AST checks and runtime replay."""
     service_path = target_root / service_rel_path
     rel_service = (
         service_path.relative_to(target_root).as_posix()
@@ -270,7 +329,9 @@ def run_cross_layer_auditor(
     if not service_path.exists():
         return SubagentReport(
             subagent_name="Subagent 02: Cross-Layer Code-to-Cloud Auditor",
-            countered_defense_step="02 Scan (Multi-AI Code & Runtime Context Analysis)",
+            countered_defense_step=(
+                "02 Scan (Multi-AI Code & Runtime Context Analysis)"
+            ),
             findings=[
                 Finding(
                     finding_id="PARALLAX-AST-MISSING",
@@ -297,7 +358,9 @@ def run_cross_layer_auditor(
     except (SyntaxError, UnicodeDecodeError, OSError) as exc:
         return SubagentReport(
             subagent_name="Subagent 02: Cross-Layer Code-to-Cloud Auditor",
-            countered_defense_step="02 Scan (Multi-AI Code & Runtime Context Analysis)",
+            countered_defense_step=(
+                "02 Scan (Multi-AI Code & Runtime Context Analysis)"
+            ),
             findings=[
                 Finding(
                     finding_id="PARALLAX-AST-SYNTAX",
@@ -317,7 +380,9 @@ def run_cross_layer_auditor(
     if not visitor.has_execute_agent_tool:
         return SubagentReport(
             subagent_name="Subagent 02: Cross-Layer Code-to-Cloud Auditor",
-            countered_defense_step="02 Scan (Multi-AI Code & Runtime Context Analysis)",
+            countered_defense_step=(
+                "02 Scan (Multi-AI Code & Runtime Context Analysis)"
+            ),
             findings=[
                 Finding(
                     finding_id="PARALLAX-AST-MISSING-HANDLER",
@@ -400,13 +465,40 @@ def run_cross_layer_auditor(
         )
 
     if has_unvalidated_fallback:
-        risk_score = 0.95
+        static_risk = 0.95
     elif has_validation_regression:
-        risk_score = 0.70
+        static_risk = 0.70
     elif visitor.reads_fallback_param and not visitor.validates_primary_prefix:
-        risk_score = 0.75
+        static_risk = 0.75
     else:
-        risk_score = 0.05
+        static_risk = 0.05
+
+    risk_score = static_risk
+    if enforce_replay_in_score:
+        replay_ok, replay_reason = run_exploit_replay_ground_truth(
+            target_root, service_rel_path=service_rel_path
+        )
+        if not replay_ok and static_risk < 0.50:
+            risk_score = 1.0
+            findings.append(
+                Finding(
+                    finding_id="PARALLAX-AST-REPLAY-DISCREPANCY",
+                    layer=Layer.CODE_AST,
+                    severity=Severity.CRITICAL,
+                    title=("Static AST Missed Exploit Bypass Caught by Runtime Replay"),
+                    description=(
+                        f"Static AST scored {static_risk:.2f}, but runtime "
+                        f"replay failed: {replay_reason}"
+                    ),
+                    remediation_hint=(
+                        "Ensure execute_agent_tool passes positive control and "
+                        "blocks all 4 exploit probes at runtime."
+                    ),
+                    file_path=rel_service,
+                )
+            )
+        elif not replay_ok and static_risk >= 0.50:
+            risk_score = max(static_risk, 0.95)
 
     open_q = list(visitor.unresolved_dynamic_tool_sites)
     if findings and not open_q:
@@ -426,9 +518,8 @@ def run_cross_layer_auditor(
 
 
 def evaluate_auditor_precision_recall() -> dict[str, float]:
-    """Run 16 seeded AST cases including adversarial patterns."""
+    """Run 16 project-authored AST seeds (including 2 labeled boundary cases)."""
     cases: list[tuple[str, bool]] = [
-        # 1. TP: Baseline unvalidated fallback_secret_id override
         (
             "\n".join(
                 [
@@ -442,7 +533,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # 2. TP: Regex format validation only (no prefix check on fallback)
         (
             "\n".join(
                 [
@@ -456,7 +546,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # 3. TP: Aliased variable fb_id override without prefix check
         (
             "\n".join(
                 [
@@ -470,7 +559,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # 4. TP: Nested truthy check without prefix validation
         (
             "\n".join(
                 [
@@ -484,7 +572,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # 5. TP: Helper function that does NOT check ALLOWED_WORKSPACE_PREFIX
         (
             "\n".join(
                 [
@@ -499,7 +586,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # 6. TN: Explicit fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX)
         (
             "\n".join(
                 [
@@ -515,7 +601,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # 7. TN: Fallback parameter removed completely
         (
             "\n".join(
                 [
@@ -528,7 +613,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # 8. TN: Post-assignment prefix guard on effective_secret_id
         (
             "\n".join(
                 [
@@ -544,7 +628,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # 9. TN: Prefix check delegated to helper function
         (
             "\n".join(
                 [
@@ -560,7 +643,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # 10. TN: Fallback read for logging only, never overwrites effective_secret_id
         (
             "\n".join(
                 [
@@ -574,7 +656,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # 11. TN: Early return on invalid fallback_id prefix
         (
             "\n".join(
                 [
@@ -587,7 +668,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # 12. TN: Allowlist membership check (fallback_id in ALLOWED_WORKSPACE_SECRETS)
         (
             "\n".join(
                 [
@@ -599,7 +679,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # 13. Adversarial TN (Known Static AST False-Positive Boundary):
+        # Case 13: Known Static AST FP Boundary (uses re.match instead of startswith)
         (
             "\n".join(
                 [
@@ -611,7 +691,7 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             False,
         ),
-        # 14. Adversarial TP (Known Static AST False-Negative Boundary):
+        # Case 14: Known Static AST FN Boundary (tuple unpacking assignment)
         (
             "\n".join(
                 [
@@ -623,7 +703,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # 15. Adversarial TP: Conditional ternary expression overwrite
         (
             "\n".join(
                 [
@@ -635,7 +714,6 @@ def evaluate_auditor_precision_recall() -> dict[str, float]:
             ),
             True,
         ),
-        # 16. Adversarial TP (Dropped '$' Regex Anchor Traversal Bypass):
         (
             "\n".join(
                 [

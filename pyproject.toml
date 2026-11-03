@@ -1,8 +1,8 @@
 [project]
 name = "project-parallax"
-version = "0.5.0"
+version = "0.6.0"
 description = "Adversarial Cloud Architecture & Split-Brain Patch Verification Engine for GCP"
-readme = "GEMINI.md"
+readme = "README.md"
 requires-python = ">=3.13"
 
 [tool.pytest.ini_options]

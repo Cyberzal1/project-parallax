@@ -1,6 +1,7 @@
 """Subagent 01: GCP Terraform IAM Graph Analyzer (Countering 01 Prepare)."""
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,100 +21,255 @@ PRIVILEGED_ROLES: dict[str, tuple[Severity, str]] = {
     ),
 }
 
+KNOWN_GCP_TERRAFORM_RESOURCES: set[str] = {
+    "google_service_account",
+    "google_cloud_run_v2_service",
+    "google_project_iam_member",
+    "google_project_iam_binding",
+    "google_project_iam_policy",
+    "google_secret_manager_secret",
+    "google_secret_manager_secret_version",
+    "google_secret_manager_secret_iam_member",
+    "google_secret_manager_secret_iam_binding",
+    "google_secret_manager_secret_iam_policy",
+    "google_service_account_iam_member",
+    "google_service_account_iam_binding",
+    "google_service_account_iam_policy",
+}
 
-def _extract_sa_identifiers(tf_data: dict[str, Any]) -> set[str]:
-    """Extract all declared google_service_account resource names and IDs."""
-    sa_ids: set[str] = set()
+PLACEHOLDER_SUBSTRINGS: tuple[str, ...] = (
+    "placeholder",
+    "example",
+    "todo",
+    "replace",
+    "changeme",
+    "dummy",
+    "your-",
+    "your_",
+)
+
+
+def _extract_declared_sas(tf_data: dict[str, Any]) -> dict[str, str]:
+    """Map SA resource names and account_ids to canonical sa:<res_name> nodes."""
+    sa_map: dict[str, str] = {}
     for block in tf_data.get("resource", []):
         if isinstance(block, dict) and "google_service_account" in block:
             for res_name, body in block["google_service_account"].items():
-                sa_ids.add(res_name)
+                canonical = f"sa:{res_name}"
+                sa_map[res_name] = canonical
                 if isinstance(body, dict) and body.get("account_id"):
-                    sa_ids.add(str(body["account_id"]))
-    return sa_ids
+                    sa_map[str(body["account_id"])] = canonical
+    return sa_map
 
 
-def _member_matches_service_account(member_str: str, declared_sas: set[str]) -> bool:
-    """Check if an IAM member string references a workload service account."""
-    if "serviceAccount:" in member_str or "google_service_account." in member_str:
-        return True
-    return any(sa in member_str for sa in declared_sas)
+def _resolve_sa_node(ref_str: str, sa_map: dict[str, str]) -> str | None:
+    """Resolve a Terraform SA reference string to its canonical sa:<name> node."""
+    for token, canonical in sa_map.items():
+        if token in ref_str:
+            return canonical
+    m = re.search(r"google_service_account\.([A-Za-z0-9_-]+)", ref_str)
+    if m:
+        return f"sa:{m.group(1)}"
+    m_email = re.search(r"serviceAccount:([A-Za-z0-9_-]+)@", ref_str)
+    if m_email:
+        acct = m_email.group(1)
+        return sa_map.get(acct, f"sa:{acct}")
+    return None
 
 
-def _validate_scoped_secret_bindings(
+def _audit_terraform_resources_and_secrets(
     tf_data: dict[str, Any],
+    raw_hcl: str,
     rel_tf: str,
-) -> list[Finding]:
-    """Detect placeholder secret_ids (e.g. 'workspace-doc-') or dangling each.key."""
-    declared_secrets: set[str] = set()
+    sa_map: dict[str, str],
+) -> tuple[list[Finding], bool, bool]:
+    """Validate resource types, declared secrets, placeholders, and SA self-grants.
+
+    Returns (findings, has_unknown_resource, has_invalid_scoped_or_self_grant).
+    """
+    findings: list[Finding] = []
+    has_unknown_res = False
+    has_scoped_issue = False
+
+    declared_secret_res: set[str] = set()
+    declared_secret_ids: set[str] = set()
     for block in tf_data.get("resource", []):
         if isinstance(block, dict) and "google_secret_manager_secret" in block:
-            for sec_res_name, sec_body in block["google_secret_manager_secret"].items():
-                declared_secrets.add(sec_res_name)
+            for sec_name, sec_body in block["google_secret_manager_secret"].items():
+                declared_secret_res.add(sec_name)
                 if isinstance(sec_body, dict) and sec_body.get("secret_id"):
-                    declared_secrets.add(str(sec_body["secret_id"]))
+                    declared_secret_ids.add(str(sec_body["secret_id"]).strip())
 
-    issues: list[Finding] = []
+    # Check raw HCL lines around secret_id for placeholder comments
+    raw_secret_comment_flagged = False
+    for line in raw_hcl.splitlines():
+        low = line.lower()
+        if "secret_id" in low and "#" in low:
+            comment_part = low.split("#", 1)[1]
+            if any(p in comment_part for p in PLACEHOLDER_SUBSTRINGS):
+                raw_secret_comment_flagged = True
+
     for block in tf_data.get("resource", []):
         if not isinstance(block, dict):
             continue
-        for res_type in (
-            "google_secret_manager_secret_iam_member",
-            "google_secret_manager_secret_iam_binding",
-            "google_secret_manager_secret_iam_policy",
-        ):
-            if res_type not in block:
-                continue
-            for bind_name, bind_body in block[res_type].items():
-                if not isinstance(bind_body, dict):
-                    continue
-                sec_id = str(bind_body.get("secret_id", "")).strip()
-                has_for_each = "for_each" in bind_body
-                is_prefix_placeholder = sec_id.endswith("-") or sec_id in (
-                    "",
-                    "workspace-doc",
-                    "placeholder",
-                    "TODO",
-                )
-                is_dangling_each = "each." in sec_id and not has_for_each
-                is_unresolved_ref = (
-                    "google_secret_manager_secret." in sec_id
-                    and not any(
-                        f"google_secret_manager_secret.{s}" in sec_id
-                        for s in declared_secrets
+        for res_type, instances in block.items():
+            if res_type not in KNOWN_GCP_TERRAFORM_RESOURCES:
+                has_unknown_res = True
+                findings.append(
+                    Finding(
+                        finding_id=(
+                            f"PARALLAX-IAM-UNKNOWN-RESOURCE-{res_type.upper()}"
+                        ),
+                        layer=Layer.IAC_IAM,
+                        severity=Severity.CRITICAL,
+                        title=(
+                            f"Unrecognized Terraform Resource Type '{res_type}' "
+                            "(Fail-Closed)"
+                        ),
+                        description=(
+                            f"{rel_tf} declares resource type '{res_type}', "
+                            "which is not a valid Google Cloud provider IAM or "
+                            "Secret Manager resource."
+                        ),
+                        remediation_hint=(
+                            "Use google_secret_manager_secret_iam_member and "
+                            "validate with terraform validate."
+                        ),
+                        file_path=rel_tf,
                     )
                 )
-                if is_prefix_placeholder or is_dangling_each or is_unresolved_ref:
-                    issues.append(
+                if raw_secret_comment_flagged or any(
+                    p in json.dumps(instances).lower() for p in PLACEHOLDER_SUBSTRINGS
+                ):
+                    has_scoped_issue = True
+                    findings.append(
                         Finding(
-                            finding_id=f"PARALLAX-IAM-INVALID-SCOPED-SECRET-{bind_name.upper()}",
+                            finding_id=(
+                                f"PARALLAX-IAM-INVALID-SCOPED-SECRET-{res_type.upper()}"
+                            ),
                             layer=Layer.IAC_IAM,
                             severity=Severity.HIGH,
-                            title=(
-                                f"Invalid or Placeholder Scoped Secret Binding "
-                                f"({bind_name})"
-                            ),
+                            title="Placeholder Secret in Unrecognized Resource",
                             description=(
-                                f"{res_type}.{bind_name} binds secret_id='{sec_id}', "
-                                "which is a prefix placeholder, dangling each.key, "
-                                "or undeclared secret resource. GCP Secret Manager "
-                                "IAM does not support prefix wildcards."
+                                f"{res_type} also contains a placeholder "
+                                "secret_id or comment."
                             ),
-                            remediation_hint=(
-                                "Bind a concrete secret_id (e.g. "
-                                "'workspace-doc-context') or a declared "
-                                "google_secret_manager_secret resource."
-                            ),
+                            remediation_hint="Use a declared secret resource.",
                             file_path=rel_tf,
                         )
                     )
-    return issues
+                continue
+
+            if not isinstance(instances, dict):
+                continue
+
+            # Check SA self-impersonation / token creator on service account
+            if res_type in (
+                "google_service_account_iam_member",
+                "google_service_account_iam_binding",
+                "google_service_account_iam_policy",
+            ):
+                for bind_name, bind_body in instances.items():
+                    body_dump = json.dumps(bind_body)
+                    if "serviceAccountTokenCreator" in body_dump:
+                        has_scoped_issue = True
+                        findings.append(
+                            Finding(
+                                finding_id=(
+                                    f"PARALLAX-IAM-SA-TOKEN-CREATOR-{bind_name.upper()}"
+                                ),
+                                layer=Layer.IAC_IAM,
+                                severity=Severity.HIGH,
+                                title=(
+                                    "Service Account Granted Token Creator "
+                                    f"({bind_name})"
+                                ),
+                                description=(
+                                    f"{res_type}.{bind_name} retains "
+                                    "roles/iam.serviceAccountTokenCreator."
+                                ),
+                                remediation_hint=(
+                                    "Remove serviceAccountTokenCreator binding."
+                                ),
+                                file_path=rel_tf,
+                            )
+                        )
+
+            # Check scoped secret bindings
+            if res_type in (
+                "google_secret_manager_secret_iam_member",
+                "google_secret_manager_secret_iam_binding",
+                "google_secret_manager_secret_iam_policy",
+            ):
+                for bind_name, bind_body in instances.items():
+                    if not isinstance(bind_body, dict):
+                        continue
+                    sec_id = str(bind_body.get("secret_id", "")).strip()
+                    low_sec = sec_id.lower()
+                    has_for_each = "for_each" in bind_body
+
+                    has_placeholder_word = any(
+                        p in low_sec for p in PLACEHOLDER_SUBSTRINGS
+                    )
+                    is_prefix_wildcard = (
+                        sec_id.endswith("-")
+                        or "*" in sec_id
+                        or sec_id in ("", "workspace-doc")
+                    )
+                    is_dangling_each = "each." in sec_id and not has_for_each
+
+                    # Must reference a declared google_secret_manager_secret
+                    refs_declared_res = any(
+                        f"google_secret_manager_secret.{r}" in sec_id
+                        for r in declared_secret_res
+                    )
+                    matches_declared_id = (
+                        sec_id in declared_secret_ids and len(declared_secret_res) > 0
+                    )
+                    is_undeclared_secret = not (
+                        refs_declared_res or matches_declared_id
+                    )
+
+                    if (
+                        has_placeholder_word
+                        or raw_secret_comment_flagged
+                        or is_prefix_wildcard
+                        or is_dangling_each
+                        or is_undeclared_secret
+                    ):
+                        has_scoped_issue = True
+                        findings.append(
+                            Finding(
+                                finding_id=(
+                                    "PARALLAX-IAM-INVALID-SCOPED-SECRET-"
+                                    f"{bind_name.upper()}"
+                                ),
+                                layer=Layer.IAC_IAM,
+                                severity=Severity.HIGH,
+                                title=(
+                                    "Invalid, Placeholder, or Undeclared Scoped "
+                                    f"Secret ({bind_name})"
+                                ),
+                                description=(
+                                    f"{res_type}.{bind_name} binds "
+                                    f"secret_id='{sec_id}', which is undeclared "
+                                    "in main.tf or uses a placeholder/prefix."
+                                ),
+                                remediation_hint=(
+                                    "Declare a google_secret_manager_secret "
+                                    "resource and reference its secret_id."
+                                ),
+                                file_path=rel_tf,
+                            )
+                        )
+
+    return findings, has_unknown_res, has_scoped_issue
 
 
 def build_iam_exposure_graph(tf_data: dict[str, Any]) -> nx.DiGraph:
-    """Build a directed graph of GCP ingress, Cloud Run, NHIs, and IAM roles."""
+    """Build a directed graph linking each Cloud Run service to its specific SA."""
     graph: nx.DiGraph = nx.DiGraph()
-    declared_sas = _extract_sa_identifiers(tf_data)
+    sa_map = _extract_declared_sas(tf_data)
 
     for block in tf_data.get("resource", []):
         if not isinstance(block, dict):
@@ -122,14 +278,28 @@ def build_iam_exposure_graph(tf_data: dict[str, Any]) -> nx.DiGraph:
             for svc_name, svc_body in block["google_cloud_run_v2_service"].items():
                 svc_node = f"cloud_run:{svc_name}"
                 graph.add_node(svc_node, kind="compute")
-                if (
-                    isinstance(svc_body, dict)
-                    and svc_body.get("ingress") == "INGRESS_TRAFFIC_ALL"
-                ):
+                if not isinstance(svc_body, dict):
+                    continue
+                if svc_body.get("ingress") == "INGRESS_TRAFFIC_ALL":
                     graph.add_edge(
                         "internet:public", svc_node, relation="https_ingress"
                     )
-                graph.add_edge(svc_node, "sa:workload_nhi", relation="assumes_nhi")
+                templates = svc_body.get("template", [])
+                sa_ref = ""
+                if isinstance(templates, list) and templates:
+                    sa_ref = str(templates[0].get("service_account", ""))
+                elif isinstance(templates, dict):
+                    sa_ref = str(templates.get("service_account", ""))
+                unique_sas = set(sa_map.values())
+                default_sa = (
+                    next(iter(unique_sas))
+                    if len(unique_sas) == 1
+                    else "sa:default_compute"
+                )
+                sa_node = _resolve_sa_node(sa_ref, sa_map) if sa_ref else default_sa
+                if sa_node:
+                    graph.add_node(sa_node, kind="service_account")
+                    graph.add_edge(svc_node, sa_node, relation="assumes_nhi")
 
         if "google_project_iam_member" in block:
             for _, bind_body in block["google_project_iam_member"].items():
@@ -139,10 +309,9 @@ def build_iam_exposure_graph(tf_data: dict[str, Any]) -> nx.DiGraph:
                 member = str(bind_body.get("member", ""))
                 role_node = f"project_role:{role}"
                 graph.add_node(role_node, kind="project_iam", role=role)
-                if _member_matches_service_account(member, declared_sas):
-                    graph.add_edge(
-                        "sa:workload_nhi", role_node, relation="granted_role"
-                    )
+                sa_node = _resolve_sa_node(member, sa_map)
+                if sa_node:
+                    graph.add_edge(sa_node, role_node, relation="granted_role")
 
         if "google_project_iam_binding" in block:
             for _, bind_body in block["google_project_iam_binding"].items():
@@ -152,13 +321,11 @@ def build_iam_exposure_graph(tf_data: dict[str, Any]) -> nx.DiGraph:
                 members = bind_body.get("members", [])
                 role_node = f"project_role:{role}"
                 graph.add_node(role_node, kind="project_iam", role=role)
-                if isinstance(members, list) and any(
-                    _member_matches_service_account(str(m), declared_sas)
-                    for m in members
-                ):
-                    graph.add_edge(
-                        "sa:workload_nhi", role_node, relation="granted_role"
-                    )
+                if isinstance(members, list):
+                    for m_str in members:
+                        sa_node = _resolve_sa_node(str(m_str), sa_map)
+                        if sa_node:
+                            graph.add_edge(sa_node, role_node, relation="granted_role")
 
         if "google_project_iam_policy" in block:
             for _, pol_body in block["google_project_iam_policy"].items():
@@ -169,27 +336,8 @@ def build_iam_exposure_graph(tf_data: dict[str, Any]) -> nx.DiGraph:
                     if role in pol_str:
                         role_node = f"project_role:{role}"
                         graph.add_node(role_node, kind="project_iam", role=role)
-                        graph.add_edge(
-                            "sa:workload_nhi",
-                            role_node,
-                            relation="granted_role",
-                        )
-
-        if "google_secret_manager_secret_iam_member" in block:
-            for _, bind_body in block[
-                "google_secret_manager_secret_iam_member"
-            ].items():
-                if not isinstance(bind_body, dict):
-                    continue
-                role = str(bind_body.get("role", ""))
-                secret_id = str(bind_body.get("secret_id", "scoped_secret"))
-                scoped_node = f"scoped_secret:{secret_id}:{role}"
-                graph.add_node(scoped_node, kind="scoped_iam", role=role)
-                graph.add_edge(
-                    "sa:workload_nhi",
-                    scoped_node,
-                    relation="scoped_access",
-                )
+                        for sa_node in set(sa_map.values()):
+                            graph.add_edge(sa_node, role_node, relation="granted_role")
 
     for data_block in tf_data.get("data", []):
         if isinstance(data_block, dict) and "google_iam_policy" in data_block:
@@ -199,11 +347,11 @@ def build_iam_exposure_graph(tf_data: dict[str, Any]) -> nx.DiGraph:
                     if role in pol_dump:
                         role_node = f"project_role:{role}"
                         graph.add_node(role_node, kind="project_iam", role=role)
-                        graph.add_edge(
-                            "sa:workload_nhi",
-                            role_node,
-                            relation="granted_role",
-                        )
+                        for sa_node in set(sa_map.values()):
+                            if sa_node.split(":", 1)[1] in pol_dump:
+                                graph.add_edge(
+                                    sa_node, role_node, relation="granted_role"
+                                )
 
     return graph
 
@@ -212,7 +360,7 @@ def run_graph_analyzer(
     target_root: Path,
     tf_rel_path: str = "benchmark_target/infra/main.tf",
 ) -> SubagentReport:
-    """Execute Subagent 01 and fail closed on missing, empty, or corrupt HCL."""
+    """Execute Subagent 01 and fail closed on unknown or invalid Terraform."""
     tf_path = target_root / tf_rel_path
     rel_tf = (
         tf_path.relative_to(target_root).as_posix()
@@ -287,6 +435,7 @@ def run_graph_analyzer(
             risk_score=1.0,
         )
 
+    sa_map = _extract_declared_sas(tf_data)
     graph = build_iam_exposure_graph(tf_data)
     compute_nodes = [n for n, d in graph.nodes(data=True) if d.get("kind") == "compute"]
     if not compute_nodes:
@@ -340,16 +489,19 @@ def run_graph_analyzer(
             )
             idx += 1
 
-    scoped_issues = _validate_scoped_secret_bindings(tf_data, rel_tf)
-    findings.extend(scoped_issues)
+    extra_findings, has_unknown_res, has_scoped_issue = (
+        _audit_terraform_resources_and_secrets(tf_data, raw_hcl, rel_tf, sa_map)
+    )
+    findings.extend(extra_findings)
 
     project_role_count = idx - 1
     if project_role_count >= 2:
         risk_score = 0.95
+    elif has_unknown_res:
+        risk_score = 0.90
     elif project_role_count == 1:
-        risk_score = 0.70
-    elif scoped_issues:
-        # Project-level edge removed, but replacement secret binding is invalid
+        risk_score = 0.75
+    elif has_scoped_issue:
         risk_score = 0.65
     else:
         risk_score = 0.10

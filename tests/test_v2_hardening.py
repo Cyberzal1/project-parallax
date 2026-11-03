@@ -535,3 +535,164 @@ def test_v5_telemetry_catches_canary_rule_predicate_narrowing(
         f.finding_id == "TELEM_RULE_PREDICATE_NARROWING_SECOPS_GCP_002"
         for f in report.findings
     )
+
+
+def test_v6_misspelled_resource_undeclared_secret_and_dedicated_sa(
+    tmp_path: Path,
+) -> None:
+    """Prove P0 #1-#3: unknown resource, undeclared secret, and SA move."""
+    _copy_baseline_to_tmp(tmp_path)
+    tf_path = tmp_path / "benchmark_target" / "infra" / "main.tf"
+
+    # (a) Misspelled resource type google_secret_iam_member (Trials 12 & 28 bug)
+    misspelled_tf = """
+resource "google_service_account" "sa_agent_runner" {
+  account_id = "sa-agent-runner"
+}
+resource "google_cloud_run_v2_service" "vertex_ops_agent" {
+  name    = "vertex-ops-agent"
+  ingress = "INGRESS_TRAFFIC_ALL"
+  template {
+    service_account = google_service_account.sa_agent_runner.email
+  }
+}
+resource "google_secret_iam_member" "hallucinated_type" {
+  secret_id = "workspace-doc-context"
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+"""
+    tf_path.write_text(misspelled_tf, encoding="utf-8")
+    r_mis = run_graph_analyzer(tmp_path)
+    assert r_mis.risk_score >= 0.85
+    assert any(
+        "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER" in f.finding_id
+        for f in r_mis.findings
+    )
+
+    # (b) Binding on an undeclared secret + placeholder comment (Trial 12 bug)
+    undeclared_tf = """
+resource "google_service_account" "sa_agent_runner" {
+  account_id = "sa-agent-runner"
+}
+resource "google_cloud_run_v2_service" "vertex_ops_agent" {
+  name    = "vertex-ops-agent"
+  ingress = "INGRESS_TRAFFIC_ALL"
+  template {
+    service_account = google_service_account.sa_agent_runner.email
+  }
+}
+resource "google_secret_manager_secret_iam_member" "undeclared_sec" {
+  secret_id = "workspace-doc-example-secret" # Replace with actual secret name
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+"""
+    tf_path.write_text(undeclared_tf, encoding="utf-8")
+    r_undec = run_graph_analyzer(tmp_path)
+    assert r_undec.risk_score == 0.65
+    assert any(
+        "PARALLAX-IAM-INVALID-SCOPED-SECRET" in f.finding_id for f in r_undec.findings
+    )
+
+    # (c) Token-creator granted to the service account on itself (Trial 14/16/18/20 bug)
+    sa_impersonation_tf = """
+resource "google_service_account" "sa_agent_runner" {
+  account_id = "sa-agent-runner"
+}
+resource "google_cloud_run_v2_service" "vertex_ops_agent" {
+  name    = "vertex-ops-agent"
+  ingress = "INGRESS_TRAFFIC_ALL"
+  template {
+    service_account = google_service_account.sa_agent_runner.email
+  }
+}
+resource "google_secret_manager_secret" "workspace_sec" {
+  secret_id = "workspace-doc-context"
+}
+resource "google_secret_manager_secret_iam_member" "valid_sec" {
+  secret_id = google_secret_manager_secret.workspace_sec.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+resource "google_service_account_iam_member" "self_token" {
+  service_account_id = google_service_account.sa_agent_runner.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+"""
+    tf_path.write_text(sa_impersonation_tf, encoding="utf-8")
+    r_self = run_graph_analyzer(tmp_path)
+    assert r_self.risk_score == 0.65
+    assert any("PARALLAX-IAM-SA-TOKEN-CREATOR" in f.finding_id for f in r_self.findings)
+
+    # (d) Moving Cloud Run to a dedicated least-privilege SA severing exposure
+    dedicated_sa_tf = """
+resource "google_service_account" "sa_legacy_overpriv" {
+  account_id = "sa-legacy-overpriv"
+}
+resource "google_service_account" "sa_dedicated_least_priv" {
+  account_id = "sa-dedicated-least-priv"
+}
+resource "google_cloud_run_v2_service" "vertex_ops_agent" {
+  name    = "vertex-ops-agent"
+  ingress = "INGRESS_TRAFFIC_ALL"
+  template {
+    service_account = google_service_account.sa_dedicated_least_priv.email
+  }
+}
+resource "google_project_iam_member" "legacy_binding" {
+  role   = "roles/secretmanager.secretAccessor"
+  member = "serviceAccount:${google_service_account.sa_legacy_overpriv.email}"
+}
+resource "google_secret_manager_secret" "workspace_sec" {
+  secret_id = "workspace-doc-context"
+}
+resource "google_secret_manager_secret_iam_member" "dedicated_scoped" {
+  secret_id = google_secret_manager_secret.workspace_sec.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.sa_dedicated_least_priv.email}"
+}
+"""
+    tf_path.write_text(dedicated_sa_tf, encoding="utf-8")
+    r_ded = run_graph_analyzer(tmp_path)
+    assert r_ded.risk_score == 0.10
+    assert len(r_ded.findings) == 0
+
+
+def test_v6_seeded_renamed_variable_bypass_caught_by_replay_and_discrepancy(
+    tmp_path: Path,
+) -> None:
+    """Prove P0 #6: renamed variable evades static AST but replay forces risk=1.0."""
+    _copy_baseline_to_tmp(tmp_path)
+    svc_path = tmp_path / "benchmark_target" / "app" / "service.py"
+    orig_code = svc_path.read_text(encoding="utf-8")
+
+    # Rename fallback_id and effective_secret_id assignment so static string
+    # check ('effective_secret_id = fallback_id') is evaded while flaw remains
+    evasive_code = orig_code.replace(
+        'fallback_id = str(tool_payload.get("fallback_secret_id", ""))',
+        'alt_sec = str(tool_payload.get("fallback_secret_id", ""))',
+    ).replace(
+        "if use_fallback and fallback_id:\n"
+        "        if not SAFE_ID_PATTERN.match(fallback_id):\n"
+        '            raise ValueError("Invalid fallback_secret_id format.")\n'
+        "        effective_secret_id = fallback_id",
+        "if use_fallback and alt_sec:\n        effective_secret_id = str(alt_sec)",
+    )
+    svc_path.write_text(evasive_code, encoding="utf-8")
+
+    # Static-only score would have been 0.05, but with replay integrated it is 1.0!
+    rep_static_only = run_cross_layer_auditor(
+        tmp_path, enable_llm_enrichment=False, enforce_replay_in_score=False
+    )
+    assert rep_static_only.risk_score == 0.05
+
+    rep_with_replay = run_cross_layer_auditor(
+        tmp_path, enable_llm_enrichment=False, enforce_replay_in_score=True
+    )
+    assert rep_with_replay.risk_score == 1.0
+    assert any(
+        f.finding_id == "PARALLAX-AST-REPLAY-DISCREPANCY"
+        for f in rep_with_replay.findings
+    )

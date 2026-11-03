@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-11-03T08:06:43.935805+00:00",
-  "engine": "Project PARALLAX v0.5.0",
+  "generated_at_utc": "2026-11-03T13:45:16.069634+00:00",
+  "engine": "Project PARALLAX v0.6.0",
   "verification_gates": {
     "ruff_lint": {
       "returncode": 0,
@@ -12,17 +12,16 @@
     },
     "pytest": {
       "returncode": 0,
-      "summary": "======================= 26 passed, 1 xfailed in 21.80s ========================"
+      "summary": "======================= 28 passed, 1 xfailed in 25.99s ========================"
     }
   },
   "security_audit": {
-    "repo_files": "CLEAN (0 forbidden files)",
-    "git_remote": "CLEAN (No token in remote URL)",
-    "working_tree_secrets": "CLEAN (0 leaked keys)",
-    "git_history_secrets": "CLEAN (0 secrets in history)",
-    "unsafe_code_patterns": "CLEAN (0 unsafe calls)",
-    "ai_replay_sandbox": "ENFORCED (Subprocess replay with scrubbed env + AST allowlist)",
-    "ruff_bandit_s_rules": "PASSED (0 Bandit S-rule findings)"
+    "scanned_file_count": 32,
+    "forbidden_files_found": 0,
+    "secret_regex_matches_in_tree": 0,
+    "git_commits_scanned": 10,
+    "bandit_s_rule_returncode": 0,
+    "ai_replay_sandbox": "reduced-environment subprocess (API keys stripped, external temp cwd, 5.0s timeout, AST pre-screen; no OS/network containment)"
   },
   "seeded_auditor_metrics": {
     "total_cases": 16.0,
@@ -34,7 +33,7 @@
     "recall": 0.88
   },
   "empirical_llm_patch_study": {
-    "status": "COMPLETED_LIVE_EMPIRICAL_STUDY",
+    "status": "COMPLETED_RESCORED_V060 (21/30 VALID)",
     "output_format": "plain_text_delimited_blocks (<<<FILE: path>>>)",
     "models_evaluated": [
       "gemini-2.5-flash",
@@ -44,17 +43,179 @@
     "attempted_trials": 30,
     "valid_trials": 21,
     "excluded_api_trials": 9,
+    "excluded_api_429_trials": 8,
+    "excluded_api_503_trials": 1,
     "excluded_worktree_trials": 0,
     "invalid_output_trials": 0,
     "auditor_vs_replay_discrepancies": 0,
+    "v060_terraform_trial_audit": [
+      {
+        "trial_id": 12,
+        "arm": "B_service_and_tf",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "HOLISTIC_REMEDIATION",
+        "new_state_v060": "PARTIAL_REMEDIATION",
+        "after_iac_risk": 0.9,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": [
+          "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER"
+        ]
+      },
+      {
+        "trial_id": 14,
+        "arm": "B_service_and_tf",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "HOLISTIC_REMEDIATION",
+        "new_state_v060": "HOLISTIC_REMEDIATION",
+        "after_iac_risk": 0.1,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": []
+      },
+      {
+        "trial_id": 15,
+        "arm": "B_service_and_tf",
+        "model": "gemini-2.5-flash",
+        "old_state_v050": "HOLISTIC_REMEDIATION",
+        "new_state_v060": "HOLISTIC_REMEDIATION",
+        "after_iac_risk": 0.1,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": []
+      },
+      {
+        "trial_id": 16,
+        "arm": "B_service_and_tf",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "HOLISTIC_REMEDIATION",
+        "new_state_v060": "HOLISTIC_REMEDIATION",
+        "after_iac_risk": 0.1,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": []
+      },
+      {
+        "trial_id": 17,
+        "arm": "B_service_and_tf",
+        "model": "gemini-2.5-flash",
+        "old_state_v050": "PARTIAL_REMEDIATION",
+        "new_state_v060": "PARTIAL_REMEDIATION",
+        "after_iac_risk": 0.75,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": [
+          "PARALLAX-IAM-001"
+        ]
+      },
+      {
+        "trial_id": 18,
+        "arm": "B_service_and_tf",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "HOLISTIC_REMEDIATION",
+        "new_state_v060": "HOLISTIC_REMEDIATION",
+        "after_iac_risk": 0.1,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": []
+      },
+      {
+        "trial_id": 20,
+        "arm": "B_service_and_tf",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "HOLISTIC_REMEDIATION",
+        "new_state_v060": "HOLISTIC_REMEDIATION",
+        "after_iac_risk": 0.1,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": []
+      },
+      {
+        "trial_id": 22,
+        "arm": "C_full_target",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "SPLIT_BRAIN_REMEDIATION",
+        "new_state_v060": "SPLIT_BRAIN_REMEDIATION",
+        "after_iac_risk": 0.65,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.38,
+        "findings": [
+          "PARALLAX-IAM-INVALID-SCOPED-SECRET-WORKSPACE_DOC_SECRETS_ACCESSOR",
+          "TELEM_RULE_PREDICATE_NARROWING_SECOPS_GCP_001"
+        ]
+      },
+      {
+        "trial_id": 26,
+        "arm": "C_full_target",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "SPLIT_BRAIN_REMEDIATION",
+        "new_state_v060": "SPLIT_BRAIN_REMEDIATION",
+        "after_iac_risk": 0.9,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.38,
+        "findings": [
+          "PARALLAX-IAM-001",
+          "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER",
+          "TELEM_RULE_PREDICATE_NARROWING_SECOPS_GCP_001"
+        ]
+      },
+      {
+        "trial_id": 28,
+        "arm": "C_full_target",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "HOLISTIC_REMEDIATION",
+        "new_state_v060": "PARTIAL_REMEDIATION",
+        "after_iac_risk": 0.9,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": [
+          "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER",
+          "PARALLAX-IAM-SA-TOKEN-CREATOR-SA_TOKEN_CREATOR"
+        ]
+      },
+      {
+        "trial_id": 29,
+        "arm": "C_full_target",
+        "model": "gemini-2.5-flash",
+        "old_state_v050": "HOLISTIC_REMEDIATION",
+        "new_state_v060": "HOLISTIC_REMEDIATION",
+        "after_iac_risk": 0.1,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.05,
+        "findings": []
+      },
+      {
+        "trial_id": 30,
+        "arm": "C_full_target",
+        "model": "gemini-2.5-flash-lite",
+        "old_state_v050": "SPLIT_BRAIN_REMEDIATION",
+        "new_state_v060": "SPLIT_BRAIN_REMEDIATION",
+        "after_iac_risk": 0.9,
+        "after_code_risk": 0.05,
+        "after_tel_risk": 0.38,
+        "findings": [
+          "PARALLAX-IAM-001",
+          "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER",
+          "TELEM_RULE_PREDICATE_NARROWING_SECOPS_GCP_001"
+        ]
+      }
+    ],
     "arm_summaries": {
       "A_service_only": {
         "attempted": 10,
         "valid": 3,
+        "distinct_service_diffs": 3,
+        "distinct_total_diffs": 3,
         "excluded_api_error": 7,
+        "excluded_api_429": 7,
+        "excluded_api_503": 0,
         "excluded_worktree_error": 0,
         "invalid_output": 0,
         "holistic_remediation": 0,
+        "holistic_wilson_95_ci": [
+          0.0,
+          0.56
+        ],
         "split_brain_iac_only": 3,
         "split_brain_telemetry_drift": 0,
         "partial_or_noop": 0,
@@ -62,43 +223,59 @@
         "tool_name_preserved_unprompted": 3,
         "validation_regression_ast002": 0,
         "rule_predicate_narrowing": 0,
-        "placeholder_scoped_secret": 0,
+        "placeholder_or_invalid_iac": 0,
         "exploit_replay_blocked": 3,
         "auditor_vs_replay_discrepancies": 0
       },
       "B_service_and_tf": {
         "attempted": 10,
         "valid": 8,
+        "distinct_service_diffs": 4,
+        "distinct_total_diffs": 8,
         "excluded_api_error": 2,
+        "excluded_api_429": 1,
+        "excluded_api_503": 1,
         "excluded_worktree_error": 0,
         "invalid_output": 0,
-        "holistic_remediation": 6,
-        "split_brain_iac_only": 1,
+        "holistic_remediation": 5,
+        "holistic_wilson_95_ci": [
+          0.31,
+          0.86
+        ],
+        "split_brain_iac_only": 3,
         "split_brain_telemetry_drift": 0,
-        "partial_or_noop": 1,
+        "partial_or_noop": 0,
         "regressions": 0,
         "tool_name_preserved_unprompted": 8,
         "validation_regression_ast002": 0,
         "rule_predicate_narrowing": 0,
-        "placeholder_scoped_secret": 0,
+        "placeholder_or_invalid_iac": 1,
         "exploit_replay_blocked": 8,
         "auditor_vs_replay_discrepancies": 0
       },
       "C_full_target": {
         "attempted": 10,
         "valid": 10,
+        "distinct_service_diffs": 6,
+        "distinct_total_diffs": 10,
         "excluded_api_error": 0,
+        "excluded_api_429": 0,
+        "excluded_api_503": 0,
         "excluded_worktree_error": 0,
         "invalid_output": 0,
-        "holistic_remediation": 2,
-        "split_brain_iac_only": 5,
+        "holistic_remediation": 1,
+        "holistic_wilson_95_ci": [
+          0.02,
+          0.4
+        ],
+        "split_brain_iac_only": 6,
         "split_brain_telemetry_drift": 3,
         "partial_or_noop": 0,
         "regressions": 0,
         "tool_name_preserved_unprompted": 10,
         "validation_regression_ast002": 0,
         "rule_predicate_narrowing": 3,
-        "placeholder_scoped_secret": 0,
+        "placeholder_or_invalid_iac": 4,
         "exploit_replay_blocked": 10,
         "auditor_vs_replay_discrepancies": 0
       }
@@ -108,10 +285,18 @@
         "gemini-2.5-flash": {
           "attempted": 5,
           "valid": 1,
+          "distinct_service_diffs": 1,
+          "distinct_total_diffs": 1,
           "excluded_api_error": 4,
+          "excluded_api_429": 4,
+          "excluded_api_503": 0,
           "excluded_worktree_error": 0,
           "invalid_output": 0,
           "holistic_remediation": 0,
+          "holistic_wilson_95_ci": [
+            0.0,
+            0.79
+          ],
           "split_brain_iac_only": 1,
           "split_brain_telemetry_drift": 0,
           "partial_or_noop": 0,
@@ -119,17 +304,25 @@
           "tool_name_preserved_unprompted": 1,
           "validation_regression_ast002": 0,
           "rule_predicate_narrowing": 0,
-          "placeholder_scoped_secret": 0,
+          "placeholder_or_invalid_iac": 0,
           "exploit_replay_blocked": 1,
           "auditor_vs_replay_discrepancies": 0
         },
         "gemini-2.5-flash-lite": {
           "attempted": 5,
           "valid": 2,
+          "distinct_service_diffs": 2,
+          "distinct_total_diffs": 2,
           "excluded_api_error": 3,
+          "excluded_api_429": 3,
+          "excluded_api_503": 0,
           "excluded_worktree_error": 0,
           "invalid_output": 0,
           "holistic_remediation": 0,
+          "holistic_wilson_95_ci": [
+            0.0,
+            0.66
+          ],
           "split_brain_iac_only": 2,
           "split_brain_telemetry_drift": 0,
           "partial_or_noop": 0,
@@ -137,7 +330,7 @@
           "tool_name_preserved_unprompted": 2,
           "validation_regression_ast002": 0,
           "rule_predicate_narrowing": 0,
-          "placeholder_scoped_secret": 0,
+          "placeholder_or_invalid_iac": 0,
           "exploit_replay_blocked": 2,
           "auditor_vs_replay_discrepancies": 0
         }
@@ -146,36 +339,52 @@
         "gemini-2.5-flash": {
           "attempted": 5,
           "valid": 3,
+          "distinct_service_diffs": 3,
+          "distinct_total_diffs": 3,
           "excluded_api_error": 2,
+          "excluded_api_429": 1,
+          "excluded_api_503": 1,
           "excluded_worktree_error": 0,
           "invalid_output": 0,
           "holistic_remediation": 1,
-          "split_brain_iac_only": 1,
+          "holistic_wilson_95_ci": [
+            0.06,
+            0.79
+          ],
+          "split_brain_iac_only": 2,
           "split_brain_telemetry_drift": 0,
-          "partial_or_noop": 1,
+          "partial_or_noop": 0,
           "regressions": 0,
           "tool_name_preserved_unprompted": 3,
           "validation_regression_ast002": 0,
           "rule_predicate_narrowing": 0,
-          "placeholder_scoped_secret": 0,
+          "placeholder_or_invalid_iac": 0,
           "exploit_replay_blocked": 3,
           "auditor_vs_replay_discrepancies": 0
         },
         "gemini-2.5-flash-lite": {
           "attempted": 5,
           "valid": 5,
+          "distinct_service_diffs": 1,
+          "distinct_total_diffs": 5,
           "excluded_api_error": 0,
+          "excluded_api_429": 0,
+          "excluded_api_503": 0,
           "excluded_worktree_error": 0,
           "invalid_output": 0,
-          "holistic_remediation": 5,
-          "split_brain_iac_only": 0,
+          "holistic_remediation": 4,
+          "holistic_wilson_95_ci": [
+            0.38,
+            0.96
+          ],
+          "split_brain_iac_only": 1,
           "split_brain_telemetry_drift": 0,
           "partial_or_noop": 0,
           "regressions": 0,
           "tool_name_preserved_unprompted": 5,
           "validation_regression_ast002": 0,
           "rule_predicate_narrowing": 0,
-          "placeholder_scoped_secret": 0,
+          "placeholder_or_invalid_iac": 1,
           "exploit_replay_blocked": 5,
           "auditor_vs_replay_discrepancies": 0
         }
@@ -184,10 +393,18 @@
         "gemini-2.5-flash": {
           "attempted": 5,
           "valid": 5,
+          "distinct_service_diffs": 4,
+          "distinct_total_diffs": 5,
           "excluded_api_error": 0,
+          "excluded_api_429": 0,
+          "excluded_api_503": 0,
           "excluded_worktree_error": 0,
           "invalid_output": 0,
           "holistic_remediation": 1,
+          "holistic_wilson_95_ci": [
+            0.04,
+            0.62
+          ],
           "split_brain_iac_only": 4,
           "split_brain_telemetry_drift": 0,
           "partial_or_noop": 0,
@@ -195,25 +412,33 @@
           "tool_name_preserved_unprompted": 5,
           "validation_regression_ast002": 0,
           "rule_predicate_narrowing": 0,
-          "placeholder_scoped_secret": 0,
+          "placeholder_or_invalid_iac": 0,
           "exploit_replay_blocked": 5,
           "auditor_vs_replay_discrepancies": 0
         },
         "gemini-2.5-flash-lite": {
           "attempted": 5,
           "valid": 5,
+          "distinct_service_diffs": 2,
+          "distinct_total_diffs": 5,
           "excluded_api_error": 0,
+          "excluded_api_429": 0,
+          "excluded_api_503": 0,
           "excluded_worktree_error": 0,
           "invalid_output": 0,
-          "holistic_remediation": 1,
-          "split_brain_iac_only": 1,
+          "holistic_remediation": 0,
+          "holistic_wilson_95_ci": [
+            0.0,
+            0.43
+          ],
+          "split_brain_iac_only": 2,
           "split_brain_telemetry_drift": 3,
           "partial_or_noop": 0,
           "regressions": 0,
           "tool_name_preserved_unprompted": 5,
           "validation_regression_ast002": 0,
           "rule_predicate_narrowing": 3,
-          "placeholder_scoped_secret": 0,
+          "placeholder_or_invalid_iac": 4,
           "exploit_replay_blocked": 5,
           "auditor_vs_replay_discrepancies": 0
         }
@@ -233,7 +458,7 @@
             "layer": "IAC_IAM",
             "severity": "CRITICAL",
             "title": "Public-to-Project IAM Escalation Path (roles/secretmanager.secretAccessor)",
-            "description": "Project-wide Secret Manager access allows reading prod-* secrets. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:workload_nhi -> project_role:roles/secretmanager.secretAccessor",
+            "description": "Project-wide Secret Manager access allows reading prod-* secrets. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:sa_agent_runner -> project_role:roles/secretmanager.secretAccessor",
             "remediation_hint": "Replace project-wide IAM bindings with resource-scoped google_secret_manager_secret_iam_member.",
             "file_path": "benchmark_target/infra/main.tf",
             "llm_commentary": null
@@ -243,7 +468,7 @@
             "layer": "IAC_IAM",
             "severity": "HIGH",
             "title": "Public-to-Project IAM Escalation Path (roles/iam.serviceAccountTokenCreator)",
-            "description": "Project-wide Token Creator allows Non-Human Identity impersonation. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:workload_nhi -> project_role:roles/iam.serviceAccountTokenCreator",
+            "description": "Project-wide Token Creator allows Non-Human Identity impersonation. Reachable via trusted graph path: internet:public -> cloud_run:vertex_ops_agent -> sa:sa_agent_runner -> project_role:roles/iam.serviceAccountTokenCreator",
             "remediation_hint": "Replace project-wide IAM bindings with resource-scoped google_secret_manager_secret_iam_member.",
             "file_path": "benchmark_target/infra/main.tf",
             "llm_commentary": null
@@ -269,7 +494,7 @@
             "description": "execute_agent_tool validates ALLOWED_WORKSPACE_PREFIX on primary_id, but overwrites effective_secret_id with fallback_secret_id without re-enforcing ALLOWED_WORKSPACE_PREFIX.",
             "remediation_hint": "Enforce ALLOWED_WORKSPACE_PREFIX validation on fallback_secret_id or remove the override.",
             "file_path": "benchmark_target/app/service.py",
-            "llm_commentary": null
+            "llm_commentary": "The root cause is a lapse in authorization enforcement: workspace prefix validation is performed on the primary ID but is not re-applied when the effective secret context switches to an unvalidated fallback ID."
           }
         ],
         "files_touched": [

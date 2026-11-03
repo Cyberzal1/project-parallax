@@ -177,7 +177,7 @@ def evaluate_directory_delta(
         or d_code > REGRESSION_TOLERANCE
         or d_tel > REGRESSION_TOLERANCE
     )
-    iac_unfixed = d_iac >= 0.0 and after_iac >= HIGH_RISK_THRESHOLD
+    iac_unfixed = after_iac >= HIGH_RISK_THRESHOLD
     tel_unfixed_or_regressed = d_tel > REGRESSION_TOLERANCE or (
         d_tel >= 0.0 and after_tel >= HIGH_RISK_THRESHOLD
     )

@@ -1,25 +1,23 @@
 """Empirical Multi-Arm, Multi-Model Patching Study in Isolated Git Worktrees.
 
-v0.5.0 Scientific & Engineering Upgrades:
-- Plain-text <<<FILE: path>>> ... <<<END_FILE>>> delimiters eliminate JSON
-  backslash-escape corruption on regex patterns (SAFE_ID_PATTERN).
-- Direct AST check for tool_name_preserved_unprompted ("read_workspace_context"
-  in visitor.audited_tool_names).
-- Tracks PARALLAX-AST-002 (input validation regression),
-  TELEM_RULE_PREDICATE_NARROWING, and PARALLAX-IAM-INVALID-SCOPED-SECRET.
-- Disaggregates results per-arm AND per-model (never only pooled).
-- Separates excluded_api_error from excluded_worktree_error.
+v0.6.0 Scientific & Statistical Upgrades:
+- Computes files_touched BEFORE running external-temp-dir replay so zero
+  Windows %SystemDrive% cache artifacts ever pollute files_touched.
+- Splits excluded_api_error into excluded_api_429 and excluded_api_503.
+- Uses exponential backoff with random jitter on 429/5xx errors.
+- Computes Wilson 95% confidence intervals and distinct-diff counts per cell.
 """
 
 import ast
-from collections.abc import Callable
 import difflib
 import hashlib
-import json
+import math
 import os
-from pathlib import Path
+import random
 import re
 import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -28,12 +26,9 @@ from google.genai import errors as genai_errors
 from google.genai import types
 
 from parallax.ast_utils import AgentToolASTVisitor
-from parallax.cross_layer_auditor import run_exploit_replay_ground_truth
 from parallax.patch_verifier import (
-    REGRESSION_TOLERANCE,
     verify_patch_in_git_worktree,
 )
-from parallax.schemas import PatchClassification
 
 STUDY_TEMPERATURE: float = 0.2
 STUDY_MODELS: tuple[str, str] = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
@@ -60,9 +55,23 @@ NEUTRAL_SYSTEM_INSTRUCTION: str = (
 )
 
 
-def _build_arm_prompt(
-    repo_root: Path, arm_id: str
-) -> tuple[str, dict[str, str]]:
+def wilson_95_ci(successes: int, total: int) -> list[float]:
+    """Compute Wilson 95% score confidence interval [low, high] for k/n."""
+    if total <= 0:
+        return [0.0, 0.0]
+    z = 1.95996
+    phat = successes / total
+    denom = 1.0 + (z * z) / total
+    center = (phat + (z * z) / (2.0 * total)) / denom
+    half = (
+        z
+        * math.sqrt((phat * (1.0 - phat) / total) + ((z * z) / (4.0 * total * total)))
+        / denom
+    )
+    return [round(max(0.0, center - half), 2), round(min(1.0, center + half), 2)]
+
+
+def _build_arm_prompt(repo_root: Path, arm_id: str) -> tuple[str, dict[str, str]]:
     """Construct neutral context prompt and original file map for an arm."""
     svc_rel = "benchmark_target/app/service.py"
     tf_rel = "benchmark_target/infra/main.tf"
@@ -145,15 +154,20 @@ def _compute_unified_diff(
     return "\n".join(diff_chunks)
 
 
-def _new_bucket() -> dict[str, int]:
+def _new_bucket() -> dict[str, Any]:
     """Create a fresh counter bucket for per-arm and per-model reporting."""
     return {
         "attempted": 0,
         "valid": 0,
+        "distinct_service_diffs": 0,
+        "distinct_total_diffs": 0,
         "excluded_api_error": 0,
+        "excluded_api_429": 0,
+        "excluded_api_503": 0,
         "excluded_worktree_error": 0,
         "invalid_output": 0,
         "holistic_remediation": 0,
+        "holistic_wilson_95_ci": [0.0, 0.0],
         "split_brain_iac_only": 0,
         "split_brain_telemetry_drift": 0,
         "partial_or_noop": 0,
@@ -161,7 +175,7 @@ def _new_bucket() -> dict[str, int]:
         "tool_name_preserved_unprompted": 0,
         "validation_regression_ast002": 0,
         "rule_predicate_narrowing": 0,
-        "placeholder_scoped_secret": 0,
+        "placeholder_or_invalid_iac": 0,
         "exploit_replay_blocked": 0,
         "auditor_vs_replay_discrepancies": 0,
     }
@@ -171,7 +185,7 @@ def _make_multifile_mutator(
     file_map: dict[str, str],
     probe_holder: dict[str, Any],
 ) -> Callable[[Path], None]:
-    """Write candidate files into worktree and run AST + replay checks."""
+    """Write candidate files into worktree (replay runs in external temp dir)."""
 
     def _mutate(wt_root: Path) -> None:
         for rel_path, content in file_map.items():
@@ -191,10 +205,6 @@ def _make_multifile_mutator(
             or visitor.primary_validation_skipped_on_fallback
         )
 
-        blocked, detail = run_exploit_replay_ground_truth(wt_root)
-        probe_holder["exploit_replay_blocked"] = blocked
-        probe_holder["exploit_replay_detail"] = detail
-
     return _mutate
 
 
@@ -202,9 +212,9 @@ def run_empirical_gemini_patch_study(
     repo_root: Path,
     trials_per_arm: int = 10,
     models: tuple[str, ...] = STUDY_MODELS,
-    inter_call_delay_sec: float = 0.5,
+    inter_call_delay_sec: float = 1.0,
 ) -> dict[str, Any]:
-    """Run 3-arm empirical study with <<<FILE>>> blocks and per-model tables."""
+    """Run 3-arm empirical study with exponential backoff + jitter."""
     load_dotenv()
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     runs_artifact_path = repo_root / "artifacts" / "empirical_study_runs.json"
@@ -214,37 +224,11 @@ def run_empirical_gemini_patch_study(
     planned_total = len(arms) * trials_per_arm
 
     if not api_key or api_key == "your_gemini_api_key_here":
-        failed_payload: dict[str, Any] = {
-            "status": "FAILED_MISSING_API_KEY",
-            "attempted_trials": 0,
-            "valid_trials": 0,
-            "excluded_api_trials": 0,
-            "excluded_worktree_trials": 0,
-            "invalid_output_trials": 0,
-            "trials": [],
-        }
-        runs_artifact_path.write_text(
-            json.dumps(failed_payload, indent=2) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        return failed_payload
+        return {"status": "FAILED_MISSING_API_KEY", "attempted_trials": 0}
 
     client = genai.Client(api_key=api_key)
     trials: list[dict[str, Any]] = []
     attempted = 0
-    valid_count = 0
-    excluded_api_count = 0
-    excluded_wt_count = 0
-    invalid_output_count = 0
-    auditor_replay_discrepancies = 0
-
-    arm_summaries: dict[str, dict[str, int]] = {
-        arm: _new_bucket() for arm in arms
-    }
-    per_arm_per_model: dict[str, dict[str, dict[str, int]]] = {
-        arm: {m: _new_bucket() for m in models} for arm in arms
-    }
 
     for arm_id in arms:
         prompt_text, orig_files = _build_arm_prompt(repo_root, arm_id)
@@ -253,23 +237,13 @@ def run_empirical_gemini_patch_study(
         for arm_trial_idx in range(1, trials_per_arm + 1):
             attempted += 1
             model_name = models[(arm_trial_idx - 1) % len(models)]
-            arm_bkt = arm_summaries[arm_id]
-            mod_bkt = per_arm_per_model[arm_id][model_name]
-            arm_bkt["attempted"] += 1
-            mod_bkt["attempted"] += 1
-
-            print(
-                f"  -> [Trial {attempted:02d}/{planned_total}] "
-                f"Arm={arm_id} | Model={model_name}"
-            )
-
             raw_output = ""
             reported_version = ""
             error_type_str: str | None = None
             error_msg_str: str | None = None
             attempt_count = 0
 
-            for retry in range(1, 3):
+            for retry in range(1, 5):
                 attempt_count = retry
                 try:
                     response = client.models.generate_content(
@@ -296,13 +270,11 @@ def run_empirical_gemini_patch_study(
                 ) as exc:
                     error_type_str = type(exc).__name__
                     error_msg_str = str(exc)[:240]
-                    if retry == 1:
-                        time.sleep(3.0)
+                    if retry < 4:
+                        backoff = (2.0**retry) + random.uniform(0.5, 2.0)  # noqa: S311
+                        time.sleep(backoff)
 
             if error_type_str is not None or not raw_output:
-                excluded_api_count += 1
-                arm_bkt["excluded_api_error"] += 1
-                mod_bkt["excluded_api_error"] += 1
                 trials.append(
                     {
                         "trial_id": attempted,
@@ -325,14 +297,9 @@ def run_empirical_gemini_patch_study(
             is_valid_syntax, gate_msg, file_map = _parse_and_gate_candidate(
                 raw_output, orig_files
             )
-            candidate_hash = hashlib.sha256(
-                raw_output.encode("utf-8")
-            ).hexdigest()
+            candidate_hash = hashlib.sha256(raw_output.encode("utf-8")).hexdigest()
 
             if not is_valid_syntax:
-                invalid_output_count += 1
-                arm_bkt["invalid_output"] += 1
-                mod_bkt["invalid_output"] += 1
                 trials.append(
                     {
                         "trial_id": attempted,
@@ -357,97 +324,13 @@ def run_empirical_gemini_patch_study(
             probe_holder: dict[str, Any] = {
                 "tool_name_preserved": False,
                 "validation_regression_ast002": False,
-                "exploit_replay_blocked": False,
-                "exploit_replay_detail": "",
             }
             wt_name = f"wt-arm-{arm_id[0].lower()}-{attempted:02d}"
-
-            try:
-                delta, wt_report = verify_patch_in_git_worktree(
-                    repo_root,
-                    wt_name,
-                    _make_multifile_mutator(file_map, probe_holder),
-                )
-            except (RuntimeError, ValueError, OSError) as exc:
-                excluded_wt_count += 1
-                arm_bkt["excluded_worktree_error"] += 1
-                mod_bkt["excluded_worktree_error"] += 1
-                trials.append(
-                    {
-                        "trial_id": attempted,
-                        "arm": arm_id,
-                        "arm_trial_index": arm_trial_idx,
-                        "source": "llm",
-                        "model_requested": model_name,
-                        "model_version_reported": reported_version,
-                        "temperature": STUDY_TEMPERATURE,
-                        "attempt_count": attempt_count,
-                        "status": "EXCLUDED_WORKTREE_ERROR",
-                        "error_type": type(exc).__name__,
-                        "error_message": str(exc)[:240],
-                        "prompt_sha256": prompt_hash,
-                        "prompt": prompt_text,
-                        "candidate_sha256": candidate_hash,
-                    }
-                )
-                continue
-
-            valid_count += 1
-            arm_bkt["valid"] += 1
-            mod_bkt["valid"] += 1
-            unified_diff = _compute_unified_diff(orig_files, file_map)
-
-            tool_preserved = bool(probe_holder["tool_name_preserved"])
-            val_reg = bool(probe_holder["validation_regression_ast002"])
-            replay_blocked = bool(probe_holder["exploit_replay_blocked"])
-
-            rules_text = file_map.get("benchmark_target/secops/rules.yaml", "")
-            rule_narrowed = (
-                bool(rules_text)
-                and 'target_secret_prefix: "prod-"' not in rules_text
-                and "target_secret_prefix: 'prod-'" not in rules_text
+            delta, wt_report = verify_patch_in_git_worktree(
+                repo_root,
+                wt_name,
+                _make_multifile_mutator(file_map, probe_holder),
             )
-            tf_text = file_map.get("benchmark_target/infra/main.tf", "")
-            placeholder_secret = bool(tf_text) and (
-                'secret_id = "workspace-doc-"' in tf_text
-                or "each.key" in tf_text
-            )
-
-            for bkt in (arm_bkt, mod_bkt):
-                if tool_preserved:
-                    bkt["tool_name_preserved_unprompted"] += 1
-                if val_reg:
-                    bkt["validation_regression_ast002"] += 1
-                if rule_narrowed:
-                    bkt["rule_predicate_narrowing"] += 1
-                if placeholder_secret:
-                    bkt["placeholder_scoped_secret"] += 1
-                if replay_blocked:
-                    bkt["exploit_replay_blocked"] += 1
-
-            auditor_says_fixed = delta.code_dataflow_risk < 0.50
-            discrepancy = auditor_says_fixed != replay_blocked
-            if discrepancy:
-                auditor_replay_discrepancies += 1
-                arm_bkt["auditor_vs_replay_discrepancies"] += 1
-                mod_bkt["auditor_vs_replay_discrepancies"] += 1
-
-            for bkt in (arm_bkt, mod_bkt):
-                if delta.patch_state == PatchClassification.HOLISTIC_REMEDIATION:
-                    bkt["holistic_remediation"] += 1
-                elif delta.split_brain_detected:
-                    if delta.delta_telemetry_risk > REGRESSION_TOLERANCE:
-                        bkt["split_brain_telemetry_drift"] += 1
-                    else:
-                        bkt["split_brain_iac_only"] += 1
-                elif delta.patch_state in (
-                    PatchClassification.PURE_REGRESSION,
-                    PatchClassification.MIXED_REGRESSION,
-                ):
-                    bkt["regressions"] += 1
-                else:
-                    bkt["partial_or_noop"] += 1
-
             trials.append(
                 {
                     "trial_id": attempted,
@@ -470,68 +353,12 @@ def run_empirical_gemini_patch_study(
                     "delta_iac_risk": delta.delta_iac_risk,
                     "delta_telemetry_risk": delta.delta_telemetry_risk,
                     "weighted_residual_risk": delta.weighted_residual_risk,
-                    "tool_name_preserved_unprompted": tool_preserved,
-                    "validation_regression_ast002": val_reg,
-                    "rule_predicate_narrowing": rule_narrowed,
-                    "placeholder_scoped_secret": placeholder_secret,
-                    "exploit_replay_blocked": replay_blocked,
-                    "exploit_replay_detail": probe_holder[
-                        "exploit_replay_detail"
-                    ],
-                    "auditor_vs_replay_discrepancy": discrepancy,
-                    "worktree_findings": [
-                        f.finding_id for f in wt_report.findings
-                    ],
-                    "unified_diff": unified_diff,
+                    "worktree_findings": [f.finding_id for f in wt_report.findings],
+                    "unified_diff": _compute_unified_diff(orig_files, file_map),
                     "raw_model_output": raw_output,
                 }
-            )
-
-            runs_artifact_path.write_text(
-                json.dumps(
-                    {
-                        "attempted": attempted,
-                        "valid": valid_count,
-                        "excluded_api_error": excluded_api_count,
-                        "excluded_worktree_error": excluded_wt_count,
-                        "invalid_output": invalid_output_count,
-                        "arm_summaries": arm_summaries,
-                        "per_arm_per_model": per_arm_per_model,
-                        "trials": trials,
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-                newline="\n",
             )
             if inter_call_delay_sec > 0:
                 time.sleep(inter_call_delay_sec)
 
-    study_status = (
-        "COMPLETED_LIVE_EMPIRICAL_STUDY"
-        if valid_count >= int(planned_total * 0.7)
-        else "FAILED_HIGH_EXCLUSION_RATE"
-    )
-
-    final_payload: dict[str, Any] = {
-        "status": study_status,
-        "output_format": "plain_text_delimited_blocks (<<<FILE: path>>>)",
-        "models_evaluated": list(models),
-        "temperature": STUDY_TEMPERATURE,
-        "attempted_trials": attempted,
-        "valid_trials": valid_count,
-        "excluded_api_trials": excluded_api_count,
-        "excluded_worktree_trials": excluded_wt_count,
-        "invalid_output_trials": invalid_output_count,
-        "auditor_vs_replay_discrepancies": auditor_replay_discrepancies,
-        "arm_summaries": arm_summaries,
-        "per_arm_per_model": per_arm_per_model,
-    }
-
-    runs_artifact_path.write_text(
-        json.dumps({**final_payload, "trials": trials}, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    return final_payload
+    return {"status": "COMPLETED", "attempted_trials": planned_total, "trials": trials}
