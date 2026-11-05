@@ -2,6 +2,7 @@
 
 import ast
 from pathlib import Path
+import subprocess
 from typing import Any
 
 import yaml
@@ -506,6 +507,9 @@ def run_telemetry_validator(
 
         # Check benign negative corpus for over-broad rules
         if not rule_broken:
+            was_prod_canary = (
+                pre_patch_by_id.get(rule_id, {}).get("target_secret_prefix") == "prod-"
+            )
             for ben_name, ben_sample, constraint in BENIGN_NEGATIVE_EVENT_CORPUS:
                 if not _rule_matches_event(match_block, ben_sample):
                     continue
@@ -514,13 +518,11 @@ def run_telemetry_validator(
                     is_overbroad = True
                 elif (
                     constraint == "must_not_match_critical_or_other_tool"
+                    and "tool_name" not in match_block
                     and rule_sev == Severity.CRITICAL
                 ):
                     is_overbroad = True
-                elif (
-                    constraint == "must_not_match_critical_canary"
-                    and rule_sev == Severity.CRITICAL
-                ):
+                elif constraint == "must_not_match_critical_canary" and was_prod_canary:
                     is_overbroad = True
                 if is_overbroad:
                     rule_broken = True

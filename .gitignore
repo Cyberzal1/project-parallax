@@ -20,3 +20,4 @@ __pycache__/
 # Git Worktrees for Subagent Patch Verification
 .worktrees/
 wt-*/
+*.pyc
