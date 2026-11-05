@@ -10,6 +10,8 @@ import networkx as nx
 
 from parallax.schemas import Finding, Layer, Severity, SubagentReport
 
+ALLOWED_WORKSPACE_SECRET_PREFIX: str = "workspace-doc-"
+
 PRIVILEGED_ROLES: dict[str, tuple[Severity, str]] = {
     "roles/secretmanager.secretAccessor": (
         Severity.CRITICAL,
@@ -21,35 +23,37 @@ PRIVILEGED_ROLES: dict[str, tuple[Severity, str]] = {
     ),
 }
 
-VALID_GCP_IAM_AND_SECRET_RESOURCES: set[str] = {
+KNOWN_CORE_IAM_AND_SECRET_TYPES: set[str] = {
     "google_service_account",
     "google_service_account_key",
-    "google_service_account_iam_member",
-    "google_service_account_iam_binding",
-    "google_service_account_iam_policy",
-    "google_project_iam_member",
-    "google_project_iam_binding",
-    "google_project_iam_policy",
     "google_project_iam_custom_role",
+    "google_organization_iam_custom_role",
     "google_secret_manager_secret",
     "google_secret_manager_secret_version",
-    "google_secret_manager_secret_iam_member",
-    "google_secret_manager_secret_iam_binding",
-    "google_secret_manager_secret_iam_policy",
-    "google_cloud_run_v2_service_iam_member",
-    "google_cloud_run_v2_service_iam_binding",
-    "google_cloud_run_v2_service_iam_policy",
 }
 
-PLACEHOLDER_SUBSTRINGS: tuple[str, ...] = (
+# Standard hashicorp/google IAM binding resource pattern across GCP services
+# (e.g. google_storage_bucket_iam_member, google_pubsub_topic_iam_member,
+# google_cloud_run_service_iam_member, google_secret_manager_secret_iam_member)
+GENERIC_GCP_IAM_RESOURCE_PATTERN: re.Pattern[str] = re.compile(
+    r"^google_[a-z0-9_]+_iam_(member|binding|policy|audit_config)$"
+)
+
+# Known hallucinated / non-existent IAM resource prefixes produced by LLMs
+INVALID_HALLUCINATED_IAM_PREFIXES: tuple[str, ...] = (
+    "google_secret_iam_",
+    "google_secrets_iam_",
+    "google_secret_manager_iam_",
+    "google_iam_secret_",
+    "google_cloudrun_iam_",
+)
+
+COMMENT_PLACEHOLDER_PATTERNS: tuple[str, ...] = (
+    "replace with actual",
+    "replace with your",
+    "todo:",
     "placeholder",
-    "example",
-    "todo",
-    "replace",
     "changeme",
-    "dummy",
-    "your-",
-    "your_",
 )
 
 
@@ -57,6 +61,17 @@ def _is_iam_or_secret_resource_type(res_type: str) -> bool:
     """Return True if resource type purports to configure IAM or Secrets."""
     low = res_type.lower()
     return "iam" in low or "secret" in low or "service_account" in low
+
+
+def _is_valid_gcp_iam_or_secret_resource(res_type: str) -> bool:
+    """Validate IAM/secret resource type against provider pattern & blocklist."""
+    if res_type in KNOWN_CORE_IAM_AND_SECRET_TYPES:
+        return True
+    if any(
+        res_type.startswith(bad_pfx) for bad_pfx in INVALID_HALLUCINATED_IAM_PREFIXES
+    ):
+        return False
+    return bool(GENERIC_GCP_IAM_RESOURCE_PATTERN.match(res_type))
 
 
 def _extract_declared_sas(tf_data: dict[str, Any]) -> dict[str, str]:
@@ -73,18 +88,59 @@ def _extract_declared_sas(tf_data: dict[str, Any]) -> dict[str, str]:
 
 
 def _resolve_sa_node(ref_str: str, sa_map: dict[str, str]) -> str | None:
-    """Resolve a Terraform SA reference string to its canonical sa:<name> node."""
-    for token, canonical in sa_map.items():
-        if token in ref_str:
-            return canonical
+    """Resolve a Terraform SA reference string using exact token boundaries."""
     m = re.search(r"google_service_account\.([A-Za-z0-9_-]+)", ref_str)
+    if m and m.group(1) in sa_map:
+        return sa_map[m.group(1)]
     if m:
         return f"sa:{m.group(1)}"
+
     m_email = re.search(r"serviceAccount:([A-Za-z0-9_-]+)@", ref_str)
     if m_email:
         acct = m_email.group(1)
         return sa_map.get(acct, f"sa:{acct}")
+
+    for token, canonical in sorted(
+        sa_map.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        pat = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(token)}(?![A-Za-z0-9_-])")
+        if pat.search(ref_str):
+            return canonical
     return None
+
+
+def _extract_resource_block_raw_span(
+    raw_hcl: str, res_type: str, bind_name: str
+) -> str:
+    """Extract the raw text span of a specific resource block for comment checks."""
+    header_pat = re.compile(
+        rf'resource\s+"{re.escape(res_type)}"\s+"{re.escape(bind_name)}"\s*\{{'
+    )
+    match = header_pat.search(raw_hcl)
+    if not match:
+        return ""
+    start = match.start()
+    depth = 0
+    for idx in range(match.end() - 1, len(raw_hcl)):
+        ch = raw_hcl[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw_hcl[start : idx + 1]
+    return raw_hcl[start:]
+
+
+def _block_has_placeholder_comment(block_raw: str) -> bool:
+    """Check if a specific resource block has a placeholder comment on secret_id."""
+    for line in block_raw.splitlines():
+        low = line.lower()
+        if "#" in low:
+            comment_part = low.split("#", 1)[1]
+            if any(p in comment_part for p in COMMENT_PLACEHOLDER_PATTERNS):
+                return True
+    return False
 
 
 def _audit_terraform_resources_and_secrets(
@@ -93,64 +149,60 @@ def _audit_terraform_resources_and_secrets(
     rel_tf: str,
     sa_map: dict[str, str],
     active_workload_sas: set[str],
-) -> tuple[list[Finding], bool, bool, bool]:
+) -> tuple[list[Finding], bool, bool, bool, bool]:
     """Validate IAM/secret resource types, scoped bindings, and positive control.
 
     Returns:
-      (findings, has_unknown_res, has_scoped_issue, has_valid_scoped_replacement)
+      (findings, has_critical_exposure, has_unknown_res, has_scoped_issue,
+       has_valid_scoped_replacement)
     """
     findings: list[Finding] = []
+    has_critical_exposure = False
     has_unknown_res = False
     has_scoped_issue = False
     has_valid_scoped_replacement = False
 
-    declared_secret_res: set[str] = set()
-    declared_secret_ids: set[str] = set()
+    # Map declared google_secret_manager_secret resource name -> secret_id string
+    declared_secret_map: dict[str, str] = {}
     for block in tf_data.get("resource", []):
         if isinstance(block, dict) and "google_secret_manager_secret" in block:
             for sec_name, sec_body in block["google_secret_manager_secret"].items():
-                declared_secret_res.add(sec_name)
+                sec_id_val = ""
                 if isinstance(sec_body, dict) and sec_body.get("secret_id"):
-                    declared_secret_ids.add(str(sec_body["secret_id"]).strip())
+                    sec_id_val = str(sec_body["secret_id"]).strip()
+                declared_secret_map[sec_name] = sec_id_val
 
-    # Scan raw HCL lines for commented-out placeholder secret blocks
-    raw_secret_comment_flagged = False
-    commented_placeholder_detected = False
+    # Check for commented-out resource blocks containing placeholder comments
     for line in raw_hcl.splitlines():
         low = line.strip().lower()
-        if "secret_id" in low and "#" in low:
-            comment_part = low.split("#", 1)[1]
-            if any(p in comment_part for p in PLACEHOLDER_SUBSTRINGS):
-                raw_secret_comment_flagged = True
-                if low.startswith("#"):
-                    commented_placeholder_detected = True
-
-    if commented_placeholder_detected:
-        findings.append(
-            Finding(
-                finding_id="PARALLAX-IAM-COMMENTED-OUT-PLACEHOLDER",
-                layer=Layer.IAC_IAM,
-                severity=Severity.MEDIUM,
-                title="Commented-Out Placeholder Secret Block in Terraform",
-                description=(
-                    f"{rel_tf} contains commented-out secret IAM blocks with "
-                    "placeholder instructions (e.g. '# Replace with actual')."
-                ),
-                remediation_hint=(
-                    "Uncomment and bind a declared google_secret_manager_secret."
-                ),
-                file_path=rel_tf,
-            )
-        )
+        if low.startswith("#") and "secret_id" in low and "#" in low[1:]:
+            comment_tail = low[1:].split("#", 1)[1]
+            if any(p in comment_tail for p in COMMENT_PLACEHOLDER_PATTERNS):
+                findings.append(
+                    Finding(
+                        finding_id="PARALLAX-IAM-COMMENTED-OUT-PLACEHOLDER",
+                        layer=Layer.IAC_IAM,
+                        severity=Severity.MEDIUM,
+                        title="Commented-Out Placeholder Secret Block in Terraform",
+                        description=(
+                            f"{rel_tf} contains commented-out secret IAM blocks "
+                            "with placeholder instructions."
+                        ),
+                        remediation_hint=(
+                            "Uncomment and bind a declared workspace-doc-* secret."
+                        ),
+                        file_path=rel_tf,
+                    )
+                )
+                break
 
     for block in tf_data.get("resource", []):
         if not isinstance(block, dict):
             continue
         for res_type, instances in block.items():
-            if (
-                _is_iam_or_secret_resource_type(res_type)
-                and res_type not in VALID_GCP_IAM_AND_SECRET_RESOURCES
-            ):
+            if _is_iam_or_secret_resource_type(
+                res_type
+            ) and not _is_valid_gcp_iam_or_secret_resource(res_type):
                 has_unknown_res = True
                 findings.append(
                     Finding(
@@ -173,26 +225,32 @@ def _audit_terraform_resources_and_secrets(
                         file_path=rel_tf,
                     )
                 )
-                if raw_secret_comment_flagged or any(
-                    p in json.dumps(instances).lower() for p in PLACEHOLDER_SUBSTRINGS
-                ):
-                    has_scoped_issue = True
-                    findings.append(
-                        Finding(
-                            finding_id=(
-                                f"PARALLAX-IAM-INVALID-SCOPED-SECRET-{res_type.upper()}"
-                            ),
-                            layer=Layer.IAC_IAM,
-                            severity=Severity.HIGH,
-                            title="Placeholder Secret in Unrecognized Resource",
-                            description=(
-                                f"{res_type} also contains a placeholder "
-                                "secret_id or comment."
-                            ),
-                            remediation_hint="Use a declared secret resource.",
-                            file_path=rel_tf,
+                if isinstance(instances, dict):
+                    for b_name in instances:
+                        span = _extract_resource_block_raw_span(
+                            raw_hcl, res_type, b_name
                         )
-                    )
+                        if _block_has_placeholder_comment(span):
+                            has_scoped_issue = True
+                            findings.append(
+                                Finding(
+                                    finding_id=(
+                                        "PARALLAX-IAM-INVALID-SCOPED-SECRET-"
+                                        f"{res_type.upper()}"
+                                    ),
+                                    layer=Layer.IAC_IAM,
+                                    severity=Severity.HIGH,
+                                    title="Placeholder Secret in Unrecognized Resource",
+                                    description=(
+                                        f"{res_type}.{b_name} contains a "
+                                        "placeholder comment on secret_id."
+                                    ),
+                                    remediation_hint=(
+                                        "Use a declared workspace-doc-* secret."
+                                    ),
+                                    file_path=rel_tf,
+                                )
+                            )
                 continue
 
             if not isinstance(instances, dict):
@@ -237,41 +295,78 @@ def _audit_terraform_resources_and_secrets(
                 for bind_name, bind_body in instances.items():
                     if not isinstance(bind_body, dict):
                         continue
-                    sec_id = str(bind_body.get("secret_id", "")).strip()
+                    block_span = _extract_resource_block_raw_span(
+                        raw_hcl, res_type, bind_name
+                    )
+                    block_comment_flagged = _block_has_placeholder_comment(block_span)
+
+                    sec_id_expr = str(bind_body.get("secret_id", "")).strip()
                     role = str(bind_body.get("role", "")).strip()
                     member_raw = json.dumps(
                         bind_body.get("member", bind_body.get("members", ""))
                     )
-                    low_sec = sec_id.lower()
                     has_for_each = "for_each" in bind_body
 
-                    has_placeholder_word = any(
-                        p in low_sec for p in PLACEHOLDER_SUBSTRINGS
-                    )
-                    is_prefix_wildcard = (
-                        sec_id.endswith("-")
-                        or "*" in sec_id
-                        or sec_id in ("", "workspace-doc")
-                    )
-                    is_dangling_each = "each." in sec_id and not has_for_each
+                    # Check public principal exposure (allUsers / allAuthenticatedUsers)
+                    if (
+                        "allUsers" in member_raw
+                        or "allAuthenticatedUsers" in member_raw
+                    ):
+                        has_critical_exposure = True
+                        findings.append(
+                            Finding(
+                                finding_id=(
+                                    "PARALLAX-IAM-PUBLIC-SECRET-EXPOSURE-"
+                                    f"{bind_name.upper()}"
+                                ),
+                                layer=Layer.IAC_IAM,
+                                severity=Severity.CRITICAL,
+                                title=(
+                                    "Public Principal Granted Secret Access "
+                                    f"({bind_name})"
+                                ),
+                                description=(
+                                    f"{res_type}.{bind_name} grants {role} to "
+                                    "allUsers or allAuthenticatedUsers."
+                                ),
+                                remediation_hint=(
+                                    "Restrict secret IAM member to the specific "
+                                    "Cloud Run workload service account."
+                                ),
+                                file_path=rel_tf,
+                            )
+                        )
+                        continue
 
-                    refs_declared_res = any(
-                        f"google_secret_manager_secret.{r}" in sec_id
-                        for r in declared_secret_res
+                    # Resolve declared google_secret_manager_secret reference
+                    resolved_sec_id = ""
+                    is_declared = False
+                    ref_match = re.search(
+                        r"google_secret_manager_secret\.([A-Za-z0-9_-]+)",
+                        sec_id_expr,
                     )
-                    matches_declared_id = (
-                        sec_id in declared_secret_ids and len(declared_secret_res) > 0
+                    if ref_match and ref_match.group(1) in declared_secret_map:
+                        is_declared = True
+                        resolved_sec_id = declared_secret_map[ref_match.group(1)]
+                    elif sec_id_expr in declared_secret_map.values() and sec_id_expr:
+                        is_declared = True
+                        resolved_sec_id = sec_id_expr
+                    else:
+                        resolved_sec_id = sec_id_expr
+
+                    is_prefix_wildcard = (
+                        resolved_sec_id.endswith("-")
+                        or "*" in resolved_sec_id
+                        or "<" in resolved_sec_id
+                        or resolved_sec_id in ("", "workspace-doc", "placeholder")
                     )
-                    is_undeclared_secret = not (
-                        refs_declared_res or matches_declared_id
-                    )
+                    is_dangling_each = "each." in sec_id_expr and not has_for_each
 
                     if (
-                        has_placeholder_word
-                        or raw_secret_comment_flagged
+                        not is_declared
+                        or block_comment_flagged
                         or is_prefix_wildcard
                         or is_dangling_each
-                        or is_undeclared_secret
                     ):
                         has_scoped_issue = True
                         findings.append(
@@ -288,8 +383,8 @@ def _audit_terraform_resources_and_secrets(
                                 ),
                                 description=(
                                     f"{res_type}.{bind_name} binds "
-                                    f"secret_id='{sec_id}', which is undeclared "
-                                    "in main.tf or uses a placeholder/prefix."
+                                    f"secret_id='{sec_id_expr}', which is "
+                                    "undeclared in main.tf or uses a placeholder."
                                 ),
                                 remediation_hint=(
                                     "Declare a google_secret_manager_secret "
@@ -298,16 +393,74 @@ def _audit_terraform_resources_and_secrets(
                                 file_path=rel_tf,
                             )
                         )
+                        continue
+
+                    # Enforce workspace-doc- scope (reject prod-* secrets!)
+                    if not resolved_sec_id.startswith(ALLOWED_WORKSPACE_SECRET_PREFIX):
+                        has_critical_exposure = True
+                        findings.append(
+                            Finding(
+                                finding_id=(
+                                    "PARALLAX-IAM-OUT-OF-SCOPE-SECRET-"
+                                    f"{bind_name.upper()}"
+                                ),
+                                layer=Layer.IAC_IAM,
+                                severity=Severity.CRITICAL,
+                                title=(
+                                    f"Out-of-Scope Secret '{resolved_sec_id}' "
+                                    f"Bound to Workload ({bind_name})"
+                                ),
+                                description=(
+                                    f"{res_type}.{bind_name} grants access to "
+                                    f"'{resolved_sec_id}', which does not match "
+                                    f"required prefix "
+                                    f"'{ALLOWED_WORKSPACE_SECRET_PREFIX}'."
+                                ),
+                                remediation_hint=(
+                                    "Only grant workload secretAccessor on "
+                                    "workspace-doc-* secrets."
+                                ),
+                                file_path=rel_tf,
+                            )
+                        )
+                        continue
+
+                    bound_sa = _resolve_sa_node(member_raw, sa_map)
+                    if (
+                        role == "roles/secretmanager.secretAccessor"
+                        and bound_sa in active_workload_sas
+                    ):
+                        has_valid_scoped_replacement = True
                     else:
-                        bound_sa = _resolve_sa_node(member_raw, sa_map)
-                        if (
-                            role == "roles/secretmanager.secretAccessor"
-                            and bound_sa in active_workload_sas
-                        ):
-                            has_valid_scoped_replacement = True
+                        has_scoped_issue = True
+                        findings.append(
+                            Finding(
+                                finding_id=(
+                                    "PARALLAX-IAM-PRINCIPAL-MISMATCH-"
+                                    f"{bind_name.upper()}"
+                                ),
+                                layer=Layer.IAC_IAM,
+                                severity=Severity.HIGH,
+                                title=(
+                                    "Scoped Secret Bound to Non-Workload "
+                                    f"Principal ({bind_name})"
+                                ),
+                                description=(
+                                    f"{res_type}.{bind_name} binds member "
+                                    f"{member_raw}, which does not resolve to "
+                                    f"active Cloud Run SA {sorted(active_workload_sas)}."
+                                ),
+                                remediation_hint=(
+                                    "Bind secretAccessor to the active Cloud Run "
+                                    "service account."
+                                ),
+                                file_path=rel_tf,
+                            )
+                        )
 
     return (
         findings,
+        has_critical_exposure,
         has_unknown_res,
         has_scoped_issue,
         has_valid_scoped_replacement,
@@ -408,7 +561,7 @@ def run_graph_analyzer(
     target_root: Path,
     tf_rel_path: str = "benchmark_target/infra/main.tf",
 ) -> SubagentReport:
-    """Execute Subagent 01 with IaC positive control and fail-closed checks."""
+    """Execute Subagent 01 with IaC positive control and scope enforcement."""
     tf_path = target_root / tf_rel_path
     rel_tf = (
         tf_path.relative_to(target_root).as_posix()
@@ -545,6 +698,7 @@ def run_graph_analyzer(
 
     (
         extra_findings,
+        has_critical_exposure,
         has_unknown_res,
         has_scoped_issue,
         has_valid_scoped_replacement,
@@ -554,7 +708,7 @@ def run_graph_analyzer(
     findings.extend(extra_findings)
 
     project_role_count = idx - 1
-    if project_role_count >= 2:
+    if project_role_count >= 2 or has_critical_exposure:
         risk_score = 0.95
     elif has_unknown_res:
         risk_score = 0.90
@@ -563,7 +717,6 @@ def run_graph_analyzer(
     elif has_scoped_issue:
         risk_score = 0.65
     elif not has_valid_scoped_replacement:
-        # IaC Positive Control failed: all access revoked with no replacement!
         findings.append(
             Finding(
                 finding_id="PARALLAX-IAM-ACCESS-REVOKED-NO-REPLACEMENT",
@@ -572,13 +725,13 @@ def run_graph_analyzer(
                 title=("All Secret Manager Access Revoked Without Scoped Replacement"),
                 description=(
                     f"{rel_tf} removed project-wide IAM roles but added zero "
-                    "valid resource-scoped secretAccessor bindings for the "
-                    "Cloud Run workload service account. Legitimate workspace "
-                    "secret reads will fail at runtime."
+                    "valid resource-scoped secretAccessor bindings on "
+                    "workspace-doc-* secrets for the Cloud Run service account."
                 ),
                 remediation_hint=(
                     "Bind google_secret_manager_secret_iam_member with "
-                    "roles/secretmanager.secretAccessor to a declared secret."
+                    "roles/secretmanager.secretAccessor to a declared "
+                    "workspace-doc-* secret."
                 ),
                 file_path=rel_tf,
             )

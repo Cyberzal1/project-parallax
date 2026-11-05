@@ -2,18 +2,21 @@ name: PARALLAX Verification Gate
 
 on:
   push:
-    branches: [main]
+    branches: [ main, master ]
   pull_request:
-    branches: [main]
+    branches: [ main, master ]
+
+permissions:
+  contents: read
 
 jobs:
   verify:
+    name: Ruff, Mypy Strict, README Sync & Pytest (Python 3.13)
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository (with full history for Git worktrees)
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -21,19 +24,29 @@ jobs:
           python-version: "3.13"
           cache: "pip"
 
+      - name: Configure Git identity for isolated worktree tests
+        run: |
+          git config --global user.email "ci@parallax.local"
+          git config --global user.name "PARALLAX CI Verifier"
+
       - name: Install pinned dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Gate 1 - Ruff Security & Style Lint
-        run: ruff check parallax benchmark_target tests
+      - name: Gate 1 - Ruff Linter & Format Check
+        run: |
+          ruff check parallax benchmark_target tests
+          ruff format --check parallax benchmark_target tests
 
       - name: Gate 2 - Mypy Strict Static Typecheck
-        run: mypy parallax benchmark_target tests
+        run: |
+          mypy parallax benchmark_target tests
 
-      - name: Gate 3 - Pytest Suite (Including Baseline xfail & Mutation Tests)
-        run: pytest
+      - name: Gate 3 - Verify README Tables Match JSON Artifacts
+        run: |
+          python -m parallax.readme_sync --check
 
-      - name: Gate 4 - Live CLI Split-Brain Differential Simulation
-        run: python -m parallax.cli
+      - name: Gate 4 - Pytest Verification & Worktree Simulation Suite
+        run: |
+          pytest -v

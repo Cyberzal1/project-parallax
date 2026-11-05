@@ -843,5 +843,194 @@ def test_v7_pathlib_rejected_with_screen_rejected_status(
     svc_path.write_text(patched, encoding="utf-8")
     rep = run_cross_layer_auditor(tmp_path, enable_llm_enrichment=False)
     f_ids = {f.finding_id for f in rep.findings}
-    assert "PARALLAX-AST-REPLAY-SCREEN_REJECTED" in f_ids
+    assert "PARALLAX-AST-REPLAY-UNVERIFIABLE-SCREEN_REJECTED" in f_ids
     assert "PARALLAX-AST-REPLAY-DISCREPANCY" not in f_ids
+
+
+def test_v8_positive_control_rejects_prod_secret_and_allusers_binding(
+    tmp_path: Path,
+) -> None:
+    """Prove Round 6 #1: prod-* secret binding and allUsers binding score 0.95 CRITICAL."""
+    _copy_baseline_to_tmp(tmp_path)
+    tf_path = tmp_path / "benchmark_target" / "infra" / "main.tf"
+
+    # (a) Patch declares prod-master-db and binds workload SA to it -> CRITICAL 0.95!
+    prod_bound_tf = """
+resource "google_service_account" "sa_agent_runner" {
+  account_id = "sa-agent-runner"
+}
+resource "google_cloud_run_v2_service" "vertex_ops_agent" {
+  name    = "vertex-ops-agent"
+  ingress = "INGRESS_TRAFFIC_ALL"
+  template {
+    service_account = google_service_account.sa_agent_runner.email
+  }
+}
+resource "google_secret_manager_secret" "prod_db" {
+  secret_id = "prod-master-db"
+}
+resource "google_secret_manager_secret_iam_member" "evil_prod_bind" {
+  secret_id = google_secret_manager_secret.prod_db.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+"""
+    tf_path.write_text(prod_bound_tf, encoding="utf-8")
+    r_prod = run_graph_analyzer(tmp_path)
+    assert r_prod.risk_score == 0.95
+    assert any(
+        "PARALLAX-IAM-OUT-OF-SCOPE-SECRET-EVIL_PROD_BIND" in f.finding_id
+        for f in r_prod.findings
+    )
+
+    # (b) Patch binds workspace secret to allUsers -> CRITICAL 0.95!
+    allusers_tf = """
+resource "google_service_account" "sa_agent_runner" {
+  account_id = "sa-agent-runner"
+}
+resource "google_cloud_run_v2_service" "vertex_ops_agent" {
+  name    = "vertex-ops-agent"
+  ingress = "INGRESS_TRAFFIC_ALL"
+  template {
+    service_account = google_service_account.sa_agent_runner.email
+  }
+}
+resource "google_secret_manager_secret" "ws_sec" {
+  secret_id = "workspace-doc-quarterly-notes"
+}
+resource "google_secret_manager_secret_iam_member" "public_bind" {
+  secret_id = google_secret_manager_secret.ws_sec.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "allUsers"
+}
+"""
+    tf_path.write_text(allusers_tf, encoding="utf-8")
+    r_pub = run_graph_analyzer(tmp_path)
+    assert r_pub.risk_score == 0.95
+    assert any(
+        "PARALLAX-IAM-PUBLIC-SECRET-EXPOSURE-PUBLIC_BIND" in f.finding_id
+        for f in r_pub.findings
+    )
+
+
+def test_v8_bucket_pubsub_iam_allowed_and_per_binding_comment_scoping(
+    tmp_path: Path,
+) -> None:
+    """Prove Round 6 #3 & #5: bucket/pubsub IAM allowed; per-binding comments."""
+    _copy_baseline_to_tmp(tmp_path)
+    tf_path = tmp_path / "benchmark_target" / "infra" / "main.tf"
+
+    # Unrelated comment at top + bucket/pubsub IAM + secret named workspace-doc-todo-notes
+    clean_tf = """
+# Replace with actual bucket name in staging if needed
+resource "google_service_account" "sa_agent_runner" {
+  account_id = "sa-agent-runner"
+}
+resource "google_cloud_run_v2_service" "vertex_ops_agent" {
+  name    = "vertex-ops-agent"
+  ingress = "INGRESS_TRAFFIC_ALL"
+  template {
+    service_account = google_service_account.sa_agent_runner.email
+  }
+}
+resource "google_storage_bucket_iam_member" "bucket_viewer" {
+  bucket = "my-workspace-bucket"
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+resource "google_pubsub_topic_iam_member" "pubsub_pub" {
+  topic  = "agent-events"
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+resource "google_secret_manager_secret" "todo_notes" {
+  secret_id = "workspace-doc-todo-notes"
+}
+resource "google_secret_manager_secret_iam_member" "scoped_ok" {
+  secret_id = google_secret_manager_secret.todo_notes.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.sa_agent_runner.email}"
+}
+"""
+    tf_path.write_text(clean_tf, encoding="utf-8")
+    rep = run_graph_analyzer(tmp_path)
+    assert rep.risk_score == 0.10
+    assert len(rep.findings) == 0
+
+
+def test_v8_telemetry_baseline_isolated_and_overbroad_benign_corpus(
+    tmp_path: Path,
+) -> None:
+    """Prove Round 6 #2 & #6: custom baseline_rules_path and benign corpus check."""
+    _copy_baseline_to_tmp(tmp_path)
+    rules_path = tmp_path / "benchmark_target" / "secops" / "rules.yaml"
+    orig_rules = rules_path.read_text(encoding="utf-8")
+
+    # 1. Over-broaden SECOPS_GCP_002 by removing target_secret_prefix: "prod-"
+    # so CRITICAL canary fires on benign workspace-doc reads!
+    overbroad_rules = orig_rules.replace('      target_secret_prefix: "prod-"\n', "")
+    rules_path.write_text(overbroad_rules, encoding="utf-8")
+    rep_broad = run_telemetry_validator(tmp_path)
+    assert rep_broad.risk_score >= 0.50
+    assert any(
+        f.finding_id == "TELEM_OVERBROAD_RULE_FALSE_POSITIVE_SECOPS_GCP_002"
+        for f in rep_broad.findings
+    )
+
+    # 2. Prove baseline_rules_path overrides any external checkout file
+    custom_base = tmp_path / "custom_baseline_rules.yaml"
+    custom_base.write_text(orig_rules, encoding="utf-8")
+    rules_path.write_text(orig_rules, encoding="utf-8")
+    rep_custom = run_telemetry_validator(tmp_path, baseline_rules_path=custom_base)
+    assert rep_custom.risk_score == 0.05
+
+
+def test_v8_unverifiable_state_and_readme_sync_and_pyc_gitignore(
+    tmp_path: Path,
+) -> None:
+    """Prove Round 6 #4 & #8: UNVERIFIABLE state, README sync, and *.pyc gitignored."""
+    import subprocess as _sp
+
+    from parallax.readme_sync import render_readme_from_artifacts
+
+    _copy_baseline_to_tmp(tmp_path)
+    svc_path = tmp_path / "benchmark_target" / "app" / "service.py"
+    orig_code = svc_path.read_text(encoding="utf-8")
+
+    # 1. Patch importing unlisted module 'pathlib' -> UNVERIFIABLE (not exploit!)
+    unverifiable_code = "import pathlib\n" + orig_code.replace(
+        "if not SAFE_ID_PATTERN.match(fallback_id):",
+        (
+            "if not SAFE_ID_PATTERN.match(fallback_id) or not "
+            "fallback_id.startswith(ALLOWED_WORKSPACE_PREFIX):"
+        ),
+    )
+    svc_path.write_text(unverifiable_code, encoding="utf-8")
+    delta_unv = evaluate_directory_delta(
+        tmp_path,
+        "test-unverifiable",
+        baseline_scores=(0.95, 0.95, 0.05),
+        files_touched=["benchmark_target/app/service.py"],
+    )
+    assert delta_unv.patch_state == PatchClassification.UNVERIFIABLE
+    assert delta_unv.split_brain_detected is False
+
+    # 2. Verify README.md matches parallax_audit_proof.json byte-for-byte
+    proof_data = json.loads(
+        (ROOT_DIR / "artifacts" / "parallax_audit_proof.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    expected_readme = render_readme_from_artifacts(proof_data)
+    actual_readme = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
+    assert actual_readme == expected_readme
+
+    # 3. Verify *.pyc and __pycache__/ are gitignored
+    chk = _sp.run(  # noqa: S603
+        ["git", "check-ignore", "parallax/__pycache__/schemas.cpython-313.pyc"],  # noqa: S607
+        cwd=str(ROOT_DIR),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert chk.returncode == 0

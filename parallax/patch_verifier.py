@@ -3,6 +3,7 @@
 import re
 import shutil
 import subprocess
+import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -87,13 +88,18 @@ def _run_git_command(
         ) from exc
 
 
-def score_directory_layers(target_dir: Path) -> tuple[float, float, float]:
+def score_directory_layers(
+    target_dir: Path,
+    baseline_rules_path: Path | None = None,
+) -> tuple[float, float, float]:
     """Compute independent (iac_risk, code_risk, telemetry_risk) for a tree."""
     iam_report = run_graph_analyzer(target_dir)
     ast_report = run_cross_layer_auditor(
         target_dir, iam_report.risk_score, enable_llm_enrichment=False
     )
-    secops_report = run_telemetry_validator(target_dir)
+    secops_report = run_telemetry_validator(
+        target_dir, baseline_rules_path=baseline_rules_path
+    )
     return (
         iam_report.risk_score,
         ast_report.risk_score,
@@ -153,10 +159,25 @@ def evaluate_directory_delta(
     patch_name: str,
     baseline_scores: tuple[float, float, float],
     files_touched: list[str] | None = None,
+    baseline_rules_path: Path | None = None,
 ) -> SplitBrainDelta:
-    """Compute before/after Split-Brain Security Delta with 8-state precision."""
+    """Compute before/after Split-Brain Security Delta with 9-state precision."""
     before_iac, before_code, before_tel = baseline_scores
-    after_iac, after_code, after_tel = score_directory_layers(worktree_root)
+    iam_rep = run_graph_analyzer(worktree_root)
+    ast_rep = run_cross_layer_auditor(
+        worktree_root, iam_rep.risk_score, enable_llm_enrichment=False
+    )
+    tel_rep = run_telemetry_validator(
+        worktree_root, baseline_rules_path=baseline_rules_path
+    )
+    after_iac = iam_rep.risk_score
+    after_code = ast_rep.risk_score
+    after_tel = tel_rep.risk_score
+
+    has_unverifiable_replay = any(
+        f.finding_id.startswith("PARALLAX-AST-REPLAY-UNVERIFIABLE-")
+        for f in ast_rep.findings
+    )
 
     d_iac = round(after_iac - before_iac, 2)
     d_code = round(after_code - before_code, 2)
@@ -172,7 +193,9 @@ def evaluate_directory_delta(
     observed_files = files_touched if files_touched is not None else []
     tf_was_edited = "benchmark_target/infra/main.tf" in observed_files
 
-    is_noop = d_iac == 0.0 and d_code == 0.0 and d_tel == 0.0
+    is_noop = (
+        d_iac == 0.0 and d_code == 0.0 and d_tel == 0.0 and not has_unverifiable_replay
+    )
     code_improved = d_code <= -MIN_CODE_IMPROVEMENT and after_code < 0.50
     minor_code_gain = -MIN_CODE_IMPROVEMENT < d_code < -REGRESSION_TOLERANCE
     any_layer_regressed = (
@@ -190,7 +213,14 @@ def evaluate_directory_delta(
 
     split_brain = False
 
-    if is_noop:
+    if has_unverifiable_replay:
+        patch_state = PatchClassification.UNVERIFIABLE
+        summary = (
+            f"[{patch_name}] UNVERIFIABLE PATCH: Runtime replay could not "
+            "verify handler due to screen rejection, timeout, or crash "
+            "(excluded from exploit counts)."
+        )
+    elif is_noop:
         patch_state = PatchClassification.NO_OP_BASELINE
         summary = (
             f"[{patch_name}] No-op / baseline state "
@@ -274,7 +304,7 @@ def verify_patch_in_git_worktree(
     patch_mutator: Callable[[Path], None],
     base_ref: str = "HEAD",
 ) -> tuple[SplitBrainDelta, SubagentReport]:
-    """Create isolated git worktree, score before/after delta, and clean up."""
+    """Create isolated git worktree, snapshot pre-patch rules, and score delta."""
     base_wt_dir = validate_worktree_path(repo_root, worktree_name)
     resolved_commit = validate_base_ref(repo_root, base_ref)
     base_wt_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -288,15 +318,24 @@ def verify_patch_in_git_worktree(
     )
 
     try:
-        before_scores = score_directory_layers(wt_dir)
-        patch_mutator(wt_dir)
-        touched, git_open_q = _detect_git_touched_files(wt_dir)
-        delta = evaluate_directory_delta(
-            wt_dir,
-            patch_name=worktree_name,
-            baseline_scores=before_scores,
-            files_touched=touched,
-        )
+        with tempfile.TemporaryDirectory(prefix="parallax_base_rules_") as r_tmp:
+            pre_rules_snapshot = Path(r_tmp) / "pre_patch_rules.yaml"
+            wt_rules = wt_dir / "benchmark_target" / "secops" / "rules.yaml"
+            if wt_rules.exists():
+                shutil.copyfile(wt_rules, pre_rules_snapshot)
+
+            before_scores = score_directory_layers(
+                wt_dir, baseline_rules_path=pre_rules_snapshot
+            )
+            patch_mutator(wt_dir)
+            touched, git_open_q = _detect_git_touched_files(wt_dir)
+            delta = evaluate_directory_delta(
+                wt_dir,
+                patch_name=worktree_name,
+                baseline_scores=before_scores,
+                files_touched=touched,
+                baseline_rules_path=pre_rules_snapshot,
+            )
 
         clean_id = re.sub(r"^WT[-_]", "", worktree_name.upper())
         findings: list[Finding] = []

@@ -25,13 +25,14 @@ class Layer(StrEnum):
 
 
 class PatchClassification(StrEnum):
-    """Explicit 8-state classification for candidate worktree patches."""
+    """Explicit 9-state classification for candidate worktree patches."""
 
     NO_OP_BASELINE = "NO_OP_BASELINE"
     HOLISTIC_REMEDIATION = "HOLISTIC_REMEDIATION"
     SPLIT_BRAIN_REMEDIATION = "SPLIT_BRAIN_REMEDIATION"
     INVALID_IAC_REMEDIATION = "INVALID_IAC_REMEDIATION"
     ACCESS_REVOKED_NO_REPLACEMENT = "ACCESS_REVOKED_NO_REPLACEMENT"
+    UNVERIFIABLE = "UNVERIFIABLE"
     PARTIAL_REMEDIATION = "PARTIAL_REMEDIATION"
     MIXED_REGRESSION = "MIXED_REGRESSION"
     PURE_REGRESSION = "PURE_REGRESSION"

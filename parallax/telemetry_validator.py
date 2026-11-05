@@ -9,8 +9,6 @@ import yaml
 from parallax.ast_utils import AgentToolASTVisitor
 from parallax.schemas import Finding, Layer, Severity, SubagentReport
 
-REPO_ROOT: Path = Path(__file__).resolve().parent.parent
-
 SEVERITY_WEIGHTS: dict[Severity, float] = {
     Severity.CRITICAL: 1.0,
     Severity.HIGH: 0.7,
@@ -28,6 +26,7 @@ RULE_MATCH_TO_SCHEMA_FIELD: dict[str, str] = {
     "allowed": "allowed",
 }
 
+# Malicious / audit-required events that MUST be caught by active rules
 BASELINE_SECURITY_EVENT_CORPUS: list[tuple[str, dict[str, Any]]] = [
     (
         "prod_db_exfiltration",
@@ -70,6 +69,52 @@ BASELINE_SECURITY_EVENT_CORPUS: list[tuple[str, dict[str, Any]]] = [
     ),
 ]
 
+# Benign / unrelated tool events that must NOT trigger false-positive alerts
+BENIGN_NEGATIVE_EVENT_CORPUS: list[tuple[str, dict[str, Any], str]] = [
+    (
+        "benign_health_check_ping",
+        {
+            "event_type": "HEALTH_CHECK_PING",
+            "tool_name": "healthz_probe",
+            "target_secret": "workspace-doc-ping",
+            "caller_identity": "system:kube_probe",
+            "service_account": (
+                "sa-agent-runner@gcp-sg-parallax-sandbox.iam.gserviceaccount.com"
+            ),
+            "allowed": True,
+        },
+        "must_not_match_any_rule",
+    ),
+    (
+        "benign_other_tool_workspace_read",
+        {
+            "event_type": "SECRET_MANAGER_ACCESS",
+            "tool_name": "list_public_templates",
+            "target_secret": "workspace-doc-public-template",
+            "caller_identity": "user:synthetic_caller",
+            "service_account": (
+                "sa-agent-runner@gcp-sg-parallax-sandbox.iam.gserviceaccount.com"
+            ),
+            "allowed": True,
+        },
+        "must_not_match_critical_or_other_tool",
+    ),
+    (
+        "benign_workspace_read_on_critical_canary",
+        {
+            "event_type": "SECRET_MANAGER_ACCESS",
+            "tool_name": "read_workspace_context",
+            "target_secret": "workspace-doc-quarterly-notes",
+            "caller_identity": "user:synthetic_caller",
+            "service_account": (
+                "sa-agent-runner@gcp-sg-parallax-sandbox.iam.gserviceaccount.com"
+            ),
+            "allowed": True,
+        },
+        "must_not_match_critical_canary",
+    ),
+]
+
 
 def _parse_severity(raw_sev: str) -> Severity:
     """Safely map rule severity string to Severity enum."""
@@ -95,11 +140,12 @@ def _rule_matches_event(
 
 
 def _load_pre_patch_baseline_rules(
+    fallback_rules_path: Path,
     baseline_rules_path: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Load pre-patch baseline rules dynamically from rules.yaml on disk."""
-    path = baseline_rules_path or (
-        REPO_ROOT / "benchmark_target" / "secops" / "rules.yaml"
+    """Load pre-patch baseline rules from explicit snapshot or target_root."""
+    path = (
+        baseline_rules_path if baseline_rules_path is not None else fallback_rules_path
     )
     if not path.exists():
         return []
@@ -135,7 +181,7 @@ def run_telemetry_validator(
     rules_rel_path: str = "benchmark_target/secops/rules.yaml",
     baseline_rules_path: Path | None = None,
 ) -> SubagentReport:
-    """Verify bidirectional SecOps coverage, schema fields, and aggregate corpus."""
+    """Verify bidirectional SecOps coverage, schema fields, and corpus replay."""
     service_path = target_root / service_rel_path
     rules_path = target_root / rules_rel_path
 
@@ -298,8 +344,7 @@ def run_telemetry_validator(
             f"statically ({sites_str})."
         )
 
-    # Load pre-patch baseline rules from disk (not hardcoded constants)
-    pre_patch_rules = _load_pre_patch_baseline_rules(baseline_rules_path)
+    pre_patch_rules = _load_pre_patch_baseline_rules(rules_path, baseline_rules_path)
     pre_patch_by_id: dict[str, dict[str, Any]] = {}
     for pr in pre_patch_rules:
         pid = str(pr.get("rule_id", "")).strip()
@@ -459,7 +504,50 @@ def run_telemetry_validator(
                 )
             )
 
-        # Check per-rule predicate narrowing against pre-patch rule definition
+        # Check benign negative corpus for over-broad rules
+        if not rule_broken:
+            for ben_name, ben_sample, constraint in BENIGN_NEGATIVE_EVENT_CORPUS:
+                if not _rule_matches_event(match_block, ben_sample):
+                    continue
+                is_overbroad = False
+                if constraint == "must_not_match_any_rule":
+                    is_overbroad = True
+                elif (
+                    constraint == "must_not_match_critical_or_other_tool"
+                    and rule_sev == Severity.CRITICAL
+                ):
+                    is_overbroad = True
+                elif (
+                    constraint == "must_not_match_critical_canary"
+                    and rule_sev == Severity.CRITICAL
+                ):
+                    is_overbroad = True
+                if is_overbroad:
+                    rule_broken = True
+                    findings.append(
+                        Finding(
+                            finding_id=(
+                                f"TELEM_OVERBROAD_RULE_FALSE_POSITIVE_{rule_id}"
+                            ),
+                            layer=Layer.SECOPS_TELEMETRY,
+                            severity=Severity.HIGH,
+                            title=(
+                                f"Over-Broad SecOps Rule {rule_id} Fires on "
+                                f"Benign Event '{ben_name}'"
+                            ),
+                            description=(
+                                f"Rule {rule_id} (severity={rule_sev}) matched "
+                                f"benign negative corpus event '{ben_name}'."
+                            ),
+                            remediation_hint=(
+                                "Constrain event_type, tool_name, and "
+                                "target_secret_prefix on high/critical rules."
+                            ),
+                            file_path=rel_rules,
+                        )
+                    )
+                    break
+
         if not rule_broken and rule_id in pre_patch_by_id:
             base_m = pre_patch_by_id[rule_id]
             lost_for_this_rule: list[str] = []
@@ -589,9 +677,6 @@ def run_telemetry_validator(
         else 0.0
     )
     dynamic_penalty = 0.15 if visitor.unresolved_dynamic_tool_sites else 0.0
-    # If aggregate + critical corpus coverage is 100% intact, per-rule redundancy
-    # narrowing (e.g. SECOPS_GCP_001 narrowed while SECOPS_GCP_002 still catches
-    # prod-*) adds only a minor 0.10 penalty (0.05 -> 0.15)
     redundancy_penalty = (
         0.10 if (broken_ratio == 0.0 and per_rule_narrowed_count > 0) else 0.0
     )
