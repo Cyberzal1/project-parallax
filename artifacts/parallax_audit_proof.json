@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-11-03T20:52:04.713260+00:00",
-  "engine": "Project PARALLAX v0.7.0",
+  "generated_at_utc": "2026-11-05T22:12:08.720603+00:00",
+  "engine": "Project PARALLAX v0.8.0",
   "verification_gates": {
     "ruff_lint": {
       "returncode": 0,
@@ -8,18 +8,18 @@
     },
     "mypy_strict": {
       "returncode": 0,
-      "summary": "Success: no issues found in 16 source files"
+      "summary": "Success: no issues found in 17 source files"
     },
     "pytest": {
       "returncode": 0,
-      "summary": "======================= 31 passed, 1 xfailed in 35.28s ========================"
+      "summary": "35 passed, 1 xfailed"
     }
   },
   "security_audit": {
-    "scanned_file_count": 32,
+    "scanned_file_count": 33,
     "forbidden_files_found": 0,
     "secret_regex_matches_in_tree": 0,
-    "git_commits_scanned": 12,
+    "git_commits_scanned": 14,
     "bandit_s_rule_returncode": 0,
     "ai_replay_sandbox": "reduced-environment subprocess (API keys stripped, external temp cwd, 5.0s timeout, AST pre-screen blocking pathlib/logging/open/getattr/dunders; no OS/network containment)"
   },
@@ -97,7 +97,6 @@
         "after_code_risk": 0.05,
         "after_telemetry_risk": 0.05,
         "findings": [
-          "PARALLAX-IAM-COMMENTED-OUT-PLACEHOLDER",
           "PARALLAX-IAM-ACCESS-REVOKED-NO-REPLACEMENT"
         ]
       },
@@ -134,7 +133,6 @@
         "after_code_risk": 0.05,
         "after_telemetry_risk": 0.05,
         "findings": [
-          "PARALLAX-IAM-COMMENTED-OUT-PLACEHOLDER",
           "PARALLAX-IAM-ACCESS-REVOKED-NO-REPLACEMENT"
         ]
       },
@@ -145,10 +143,9 @@
         "patch_state": "INVALID_IAC_REMEDIATION",
         "after_iac_risk": 0.65,
         "after_code_risk": 0.05,
-        "after_telemetry_risk": 0.15,
+        "after_telemetry_risk": 0.05,
         "findings": [
-          "PARALLAX-IAM-INVALID-SCOPED-SECRET-WORKSPACE_DOC_SECRETS_ACCESSOR",
-          "TELEM_RULE_PREDICATE_NARROWING_SECOPS_GCP_001"
+          "PARALLAX-IAM-INVALID-SCOPED-SECRET-WORKSPACE_DOC_SECRETS_ACCESSOR"
         ]
       },
       {
@@ -158,11 +155,10 @@
         "patch_state": "INVALID_IAC_REMEDIATION",
         "after_iac_risk": 0.9,
         "after_code_risk": 0.05,
-        "after_telemetry_risk": 0.15,
+        "after_telemetry_risk": 0.05,
         "findings": [
           "PARALLAX-IAM-001",
-          "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER",
-          "TELEM_RULE_PREDICATE_NARROWING_SECOPS_GCP_001"
+          "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER"
         ]
       },
       {
@@ -197,11 +193,10 @@
         "patch_state": "INVALID_IAC_REMEDIATION",
         "after_iac_risk": 0.9,
         "after_code_risk": 0.05,
-        "after_telemetry_risk": 0.15,
+        "after_telemetry_risk": 0.05,
         "findings": [
           "PARALLAX-IAM-001",
-          "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER",
-          "TELEM_RULE_PREDICATE_NARROWING_SECOPS_GCP_001"
+          "PARALLAX-IAM-UNKNOWN-RESOURCE-GOOGLE_SECRET_IAM_MEMBER"
         ]
       }
     ],
@@ -285,7 +280,7 @@
         "regressions": 0,
         "tool_name_preserved_unprompted": 10,
         "validation_regression_ast002": 0,
-        "per_rule_predicate_narrowing": 3,
+        "per_rule_predicate_narrowing": 0,
         "aggregate_telemetry_blindspot": 0,
         "exploit_replay_blocked": 10,
         "auditor_vs_replay_discrepancies": 0
@@ -460,7 +455,7 @@
           "regressions": 0,
           "tool_name_preserved_unprompted": 5,
           "validation_regression_ast002": 0,
-          "per_rule_predicate_narrowing": 3,
+          "per_rule_predicate_narrowing": 0,
           "aggregate_telemetry_blindspot": 0,
           "exploit_replay_blocked": 5,
           "auditor_vs_replay_discrepancies": 0
@@ -517,7 +512,7 @@
             "description": "execute_agent_tool validates ALLOWED_WORKSPACE_PREFIX on primary_id, but overwrites effective_secret_id with fallback_secret_id without re-enforcing ALLOWED_WORKSPACE_PREFIX.",
             "remediation_hint": "Enforce ALLOWED_WORKSPACE_PREFIX validation on fallback_secret_id or remove the override.",
             "file_path": "benchmark_target/app/service.py",
-            "llm_commentary": null
+            "llm_commentary": "The `execute_agent_tool` security flaw allows for an `ALLOWED_WORKSPACE_PREFIX` bypass because validation is not re-enforced when `effective_secret_id` is silently overwritten with `fallback_secret_id`."
           }
         ],
         "files_touched": [

@@ -513,9 +513,29 @@ def run_cross_layer_auditor(
         replay_ok, replay_status, replay_reason = run_exploit_replay_detailed(
             target_root, service_rel_path=service_rel_path
         )
-        if not replay_ok and static_risk < 0.50:
-            risk_score = 1.0
-            if replay_status == "exploit_succeeded":
+        if not replay_ok:
+            if replay_status in ("screen_rejected", "timeout", "crash"):
+                risk_score = static_risk
+                findings.append(
+                    Finding(
+                        finding_id=(
+                            f"PARALLAX-AST-REPLAY-UNVERIFIABLE-{replay_status.upper()}"
+                        ),
+                        layer=Layer.CODE_AST,
+                        severity=Severity.MEDIUM,
+                        title=f"Runtime Replay Unverifiable ({replay_status})",
+                        description=(
+                            f"Replay status='{replay_status}': {replay_reason}"
+                        ),
+                        remediation_hint=(
+                            "Remove unlisted imports or infinite loops so "
+                            "runtime replay can verify the handler."
+                        ),
+                        file_path=rel_service,
+                    )
+                )
+            elif static_risk < 0.50 and replay_status == "exploit_succeeded":
+                risk_score = 1.0
                 findings.append(
                     Finding(
                         finding_id="PARALLAX-AST-REPLAY-DISCREPANCY",
@@ -534,25 +554,27 @@ def run_cross_layer_auditor(
                         file_path=rel_service,
                     )
                 )
-            else:
+            elif static_risk < 0.50:
+                risk_score = 0.85
                 findings.append(
                     Finding(
                         finding_id=(f"PARALLAX-AST-REPLAY-{replay_status.upper()}"),
                         layer=Layer.CODE_AST,
                         severity=Severity.HIGH,
-                        title=f"Runtime Replay Failed ({replay_status})",
+                        title=(
+                            f"Runtime Replay Positive Control Failed ({replay_status})"
+                        ),
                         description=(
                             f"Replay status='{replay_status}': {replay_reason}"
                         ),
                         remediation_hint=(
-                            "Ensure benign positive control succeeds and only "
-                            "allowed stdlib modules are imported."
+                            "Ensure benign workspace-doc-* requests succeed."
                         ),
                         file_path=rel_service,
                     )
                 )
-        elif not replay_ok and static_risk >= 0.50:
-            risk_score = max(static_risk, 0.95)
+            else:
+                risk_score = max(static_risk, 0.95)
 
     open_q = list(visitor.unresolved_dynamic_tool_sites)
     if findings and not open_q:

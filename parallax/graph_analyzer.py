@@ -10,7 +10,7 @@ import networkx as nx
 
 from parallax.schemas import Finding, Layer, Severity, SubagentReport
 
-ALLOWED_WORKSPACE_SECRET_PREFIX: str = "workspace-doc-"
+ALLOWED_WORKSPACE_PREFIX_ID: str = "workspace-doc-"
 
 PRIVILEGED_ROLES: dict[str, tuple[Severity, str]] = {
     "roles/secretmanager.secretAccessor": (
@@ -396,7 +396,7 @@ def _audit_terraform_resources_and_secrets(
                         continue
 
                     # Enforce workspace-doc- scope (reject prod-* secrets!)
-                    if not resolved_sec_id.startswith(ALLOWED_WORKSPACE_SECRET_PREFIX):
+                    if not resolved_sec_id.startswith(ALLOWED_WORKSPACE_PREFIX_ID):
                         has_critical_exposure = True
                         findings.append(
                             Finding(
@@ -414,7 +414,7 @@ def _audit_terraform_resources_and_secrets(
                                     f"{res_type}.{bind_name} grants access to "
                                     f"'{resolved_sec_id}', which does not match "
                                     f"required prefix "
-                                    f"'{ALLOWED_WORKSPACE_SECRET_PREFIX}'."
+                                    f"'{ALLOWED_WORKSPACE_PREFIX_ID}'."
                                 ),
                                 remediation_hint=(
                                     "Only grant workload secretAccessor on "
@@ -448,7 +448,7 @@ def _audit_terraform_resources_and_secrets(
                                 description=(
                                     f"{res_type}.{bind_name} binds member "
                                     f"{member_raw}, which does not resolve to "
-                                    f"active Cloud Run SA {sorted(active_workload_sas)}."
+                                    f"active SA {sorted(active_workload_sas)}."
                                 ),
                                 remediation_hint=(
                                     "Bind secretAccessor to the active Cloud Run "

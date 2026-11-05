@@ -1,5 +1,6 @@
 """Verification Gate 4: Complete P1 & P2 Hardening and Mutation Test Suite."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -850,7 +851,7 @@ def test_v7_pathlib_rejected_with_screen_rejected_status(
 def test_v8_positive_control_rejects_prod_secret_and_allusers_binding(
     tmp_path: Path,
 ) -> None:
-    """Prove Round 6 #1: prod-* secret binding and allUsers binding score 0.95 CRITICAL."""
+    """Prove Round 6 #1: prod-* secret and allUsers bindings score 0.95."""
     _copy_baseline_to_tmp(tmp_path)
     tf_path = tmp_path / "benchmark_target" / "infra" / "main.tf"
 
@@ -920,7 +921,7 @@ def test_v8_bucket_pubsub_iam_allowed_and_per_binding_comment_scoping(
     _copy_baseline_to_tmp(tmp_path)
     tf_path = tmp_path / "benchmark_target" / "infra" / "main.tf"
 
-    # Unrelated comment at top + bucket/pubsub IAM + secret named workspace-doc-todo-notes
+    # Unrelated comment at top + bucket/pubsub IAM + workspace-doc-todo-notes
     clean_tf = """
 # Replace with actual bucket name in staging if needed
 resource "google_service_account" "sa_agent_runner" {

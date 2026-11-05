@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Deterministic README & Artifact Synchronizer and CI Drift Gate.
 
 Usage:
@@ -19,7 +20,6 @@ def render_readme_from_artifacts(proof_data: dict[str, Any]) -> str:
     study = proof_data["empirical_llm_patch_study"]
     gates = proof_data["verification_gates"]
     sec = proof_data["security_audit"]
-    ast_m = proof_data["seeded_auditor_metrics"]
     pm = study["per_arm_per_model"]
     audit_rows = study["v070_terraform_trial_audit"]
 
